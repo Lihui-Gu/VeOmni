@@ -156,6 +156,7 @@ def main():
         basic_modules=list(set(getattr(model, "_no_split_modules", None) or []) | set(args.model.basic_modules)),
         enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
         enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
+        enable_backward_prefetch=args.train.accelerator.fsdp_config.backward_prefetch,
     )
 
     optimizer = build_optimizer(

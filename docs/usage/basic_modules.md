@@ -35,11 +35,13 @@ VeOmni offers a unified argument management system, which can be easily extended
 from dataclasses import dataclass, field
 from veomni.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, VeOmniArguments
 
+
 @dataclass
 class Arguments(VeOmniArguments):
     model: "ModelArguments" = field(default_factory=ModelArguments)
     data: "DataArguments" = field(default_factory=DataArguments)
     train: "TrainingArguments" = field(default_factory=TrainingArguments)
+
 
 if __name__ == "__main__":
     args = parse_args(Arguments)
@@ -55,6 +57,7 @@ class CustomTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Enable me if necessary."},
     )
+
 
 @dataclass
 class Arguments(VeOmniArguments):
@@ -83,18 +86,18 @@ from veomni.distributed.parallel_state import (
 )
 
 init_parallel_state(
-    dp_size=args.train.accelerator.dp_size, # data parallel size
-    dp_replicate_size=args.train.accelerator.dp_replicate_size, # data parallel replicate size
-    dp_shard_size=args.train.accelerator.dp_shard_size, # data parallel shard degree
-    tp_size=args.train.accelerator.tp_size, # tensor parallel size
-    pp_size=args.train.accelerator.pp_size, # pipeline parallel size, not support now
-    cp_size=args.train.accelerator.cp_size, # context parallel size, not support now
-    ulysses_size=args.train.accelerator.ulysses_size, # ulysses parallel size
-    extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes, # including expert parallel size
+    dp_size=args.train.accelerator.dp_size,  # data parallel size
+    dp_replicate_size=args.train.accelerator.dp_replicate_size,  # data parallel replicate size
+    dp_shard_size=args.train.accelerator.dp_shard_size,  # data parallel shard degree
+    tp_size=args.train.accelerator.tp_size,  # tensor parallel size
+    pp_size=args.train.accelerator.pp_size,  # pipeline parallel size, not support now
+    cp_size=args.train.accelerator.cp_size,  # context parallel size, not support now
+    ulysses_size=args.train.accelerator.ulysses_size,  # ulysses parallel size
+    extra_parallel_sizes=args.train.accelerator.extra_parallel_sizes,  # including expert parallel size
     extra_parallel_placement_innermost=args.train.accelerator.extra_parallel_placement_innermost,
     extra_parallel_names=args.train.accelerator.extra_parallel_names,
-    dp_mode=args.train.accelerator.fsdp_config.fsdp_mode, # data parallel mode, can be "ddp" or "fsdp2"
-    async_enabled=args.train.accelerator.enable_async, # async ulysses
+    dp_mode=args.train.accelerator.fsdp_config.fsdp_mode,  # data parallel mode, can be "ddp" or "fsdp2"
+    async_enabled=args.train.accelerator.enable_async,  # async ulysses
     name="base",
 )
 
@@ -128,11 +131,9 @@ VeOmni registers five dataset builders in [veomni/data/dataset.py](https://githu
 
 ```python
 from veomni.data import build_dataset
+
 train_dataset = build_dataset(
-    dataset_name=args.data.dataset_name,
-    transform=transform,
-    seed=args.train.seed,
-    **asdict(args.data)
+    dataset_name=args.data.dataset_name, transform=transform, seed=args.train.seed, **asdict(args.data)
 )
 ```
 
@@ -192,7 +193,7 @@ def build_custom_dataset(
     seed: int = 42,
     source_name: Optional[str] = None,
     **kwargs,
-)-> Dataset:
+) -> Dataset:
     # Implement your custom dataset logic
     pass
 ```
@@ -277,6 +278,7 @@ you can add your custom chat template by implementing the `ChatTemplate` class.
 ```python
 from veomni.data.chat_template import ChatTemplate
 
+
 class CustomTemplate(ChatTemplate):
     def encode_messages(self, messages: Sequence[Dict[str, str]], max_seq_len: int = 8192) -> Dict[str, List[int]]:
         # Implement encoding logic
@@ -296,25 +298,26 @@ VeOmni offered a flexible and powerful dataloader implementation, which supports
 
 ```python
 from veomni.data import build_dataloader
+
 train_dataloader = build_dataloader(
     dataloader_type=args.data.dataloader.type,
     dataset=train_dataset,
-    micro_batch_size=args.train.micro_batch_size, # micro batch size
-    global_batch_size=args.train.global_batch_size, # global batch size
-    dataloader_batch_size=args.train.dataloader_batch_size, # dataloader batch size, how many micro batches to get with next(train_dataloader), automatically calculate
-    max_seq_len=args.data.max_seq_len, # max sequence length
-    train_steps=args.train_steps, # calculated by args.compute_train_steps
-    dyn_bsz=args.train.dyn_bsz, # enable dynamic batching
-    bsz_warmup_ratio=args.train.bsz_warmup_ratio, # bsz warmup ratio
-    bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken, # bsz warmup init micro batch token
-    dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size, # dynamic batching buffer size
-    num_workers=args.data.dataloader.num_workers, # dataloader num workers
+    micro_batch_size=args.train.micro_batch_size,  # micro batch size
+    global_batch_size=args.train.global_batch_size,  # global batch size
+    dataloader_batch_size=args.train.dataloader_batch_size,  # dataloader batch size, how many micro batches to get with next(train_dataloader), automatically calculate
+    max_seq_len=args.data.max_seq_len,  # max sequence length
+    train_steps=args.train_steps,  # calculated by args.compute_train_steps
+    dyn_bsz=args.train.dyn_bsz,  # enable dynamic batching
+    bsz_warmup_ratio=args.train.bsz_warmup_ratio,  # bsz warmup ratio
+    bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,  # bsz warmup init micro batch token
+    dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,  # dynamic batching buffer size
+    num_workers=args.data.dataloader.num_workers,  # dataloader num workers
     drop_last=args.data.dataloader.drop_last,  # dataloader drop last
     pin_memory=args.data.dataloader.pin_memory,  # dataloader pin memory
-    prefetch_factor=args.data.dataloader.prefetch_factor, # dataloader prefetch factor
-    seed=args.train.seed, # random seed
+    prefetch_factor=args.data.dataloader.prefetch_factor,  # dataloader prefetch factor
+    seed=args.train.seed,  # random seed
     build_collate_fn=True,
-    collate_fn_kwargs=collate_fn_kwargs, # kwargs for collate_fn
+    collate_fn_kwargs=collate_fn_kwargs,  # kwargs for collate_fn
 )
 ```
 
@@ -353,9 +356,9 @@ An example of usage in `def build_data_collate_info` in [veomni/trainer/vlm_trai
 from veomni.models import build_foundation_model
 
 model = build_foundation_model(
-    config_path=args.model.config_path, # model config path, can be None if weights_path is not None
-    weights_path=args.model.model_path, # model weights path, can be None if config_path is not None
-    init_device=args.train.init_device, # model init device
+    config_path=args.model.config_path,  # model config path, can be None if weights_path is not None
+    weights_path=args.model.model_path,  # model weights path, can be None if config_path is not None
+    init_device=args.train.init_device,  # model init device
     torch_dtype="float32" if args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
     ops_implementation=args.model.ops_implementation,
     config_kwargs=config_kwargs,
@@ -368,21 +371,25 @@ model = build_foundation_model(
 ### Parallelization your model
 ```python
 from veomni.distributed.torch_parallelize import build_parallelize_model
+
 model = build_parallelize_model(
     model,
-    init_device=args.train.init_device, # model init device
+    init_device=args.train.init_device,  # model init device
     weights_path=args.model.model_path,
-    enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward, # enable reshard after forward for FSDP2
-    mixed_precision=args.train.accelerator.fsdp_config.mixed_precision, # enable mixed precision
-    enable_gradient_checkpointing=args.train.gradient_checkpointing.enable, # enable gradient checkpointing
-    enable_fsdp_offload=args.train.accelerator.fsdp_config.offload, # enable fsdp offload
-    basic_modules=list(set(getattr(model, "_no_split_modules", None) or []) | set(args.model.basic_modules)), # FSDP basic modules
+    enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,  # enable reshard after forward for FSDP2
+    mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,  # enable mixed precision
+    enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,  # enable gradient checkpointing
+    enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,  # enable fsdp offload
+    basic_modules=list(
+        set(getattr(model, "_no_split_modules", None) or []) | set(args.model.basic_modules)
+    ),  # FSDP basic modules
     enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
     early_stop=args.train.gradient_checkpointing.early_stop,
     enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
-    broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0, # load model weights
+    enable_backward_prefetch=args.train.accelerator.fsdp_config.backward_prefetch,
+    broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,  # load model weights
     ep_sharded_stream_load=args.train.ep_sharded_stream_load,
-    max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size, # max load broadcast size
+    max_load_broadcast_size=args.train.accelerator.fsdp_config.max_load_broadcast_size,  # max load broadcast size
 )
 ```
 
@@ -532,8 +539,10 @@ import torch
 
 loss_fct = torch.nn.CrossEntropyLoss()
 
+
 def loss_func(logits, labels):
     return loss_fct(logits, labels)
+
 
 # In train loop:
 output = model(**micro_batch)

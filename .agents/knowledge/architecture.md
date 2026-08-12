@@ -142,6 +142,7 @@ VeOmni uses FSDP2 exclusively.
    - `fully_shard()` on EP modules with `ep_fsdp` submesh (Shard(1) for hidden dim)
    - `fully_shard()` on each transformer block with `fsdp_mesh`
    - `fully_shard()` on root model
+   - For ExtraParallel or mixed-precision-ignored modules, configure explicit per-nested-group forward/backward prefetch. Backward prefetch pairs each nested FSDP module in layer `i` with the same-index module in layer `i-1` (e.g. `expert[i] -> expert[i-1]`) to avoid PyTorch's dynamic `post_forward_order` prefetch, which can target the wrong expert group when activation checkpointing recomputes forward during backward.
 4. SP is orthogonal to FSDP2 — models call Ulysses all-to-all (`gather_seq_scatter_heads` / `gather_heads_scatter_seq`) around attention; the FSDP shard mesh fuses with SP mesh (`dp_shard_sp`)
 5. EP token routing is in model MoE code + `moe_layer.py` using `ep_group` from `ParallelState`
 

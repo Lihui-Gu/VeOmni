@@ -232,6 +232,7 @@ def main():
         basic_modules=model._no_split_modules + args.model.basic_modules,
         enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
         enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
+        enable_backward_prefetch=args.train.accelerator.fsdp_config.backward_prefetch,
     )
     optimizer = build_optimizer(
         model,

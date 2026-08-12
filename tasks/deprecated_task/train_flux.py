@@ -309,6 +309,7 @@ def main():
         basic_modules=model._no_split_modules,
         enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
         enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
+        enable_backward_prefetch=args.train.accelerator.fsdp_config.backward_prefetch,
         use_orig_params=_use_orig_params,
         ops_to_save=ops_to_save,
     )

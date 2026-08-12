@@ -77,6 +77,7 @@ Core entry points:
    - Expert computation: `EPGroupGemm` runs fused expert MLP on grouped tokens per rank.
    - Device mesh: `init_parallel_state()` builds `[ep × ep_fsdp]` submesh; accessed via `ParallelState.extra_parallel_mesh("ep")`, `ep_group`, `ep_rank`.
    - In FSDP2: expert modules get `fully_shard()` on the `ep_fsdp` submesh with `Shard(1)` placement so hidden-dim sharding composes with EP's dim-0 sharding.
+   - **Backward prefetch caveat**: PyTorch FSDP2's default backward prefetch derives targets from a dynamic `post_forward_order`. With gradient checkpointing, recomputation rewrites this order; with nested FSDP groups (e.g. MoE experts inside a decoder layer) the resulting prefetch can target the wrong expert group, leaving its `_all_gather_result` buffer alive until the end of backward. `parallelize_model_fsdp2()` configures explicit per-nested-group backward prefetch (`decoder[i] → decoder[i-1]`, `expert[i] → expert[i-1]`); disable it via `train.accelerator.fsdp_config.backward_prefetch=false` if a new topology still shows stranded buffers.
 
 ## Data Pipeline
 

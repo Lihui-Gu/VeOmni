@@ -469,25 +469,52 @@ def parallelize_model_fsdp2(
     fully_shard(model, **root_fsdp_kwargs)
 
     # configure manual prefetching when needed
-    need_manual_prefetch = (
-        parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None
-    ) and kwargs.pop("enable_forward_prefetch", True)
-    if need_manual_prefetch:
+    any_manual_prefetch_target = parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None
+    enable_forward_prefetch = any_manual_prefetch_target and kwargs.pop("enable_forward_prefetch", True)
+    enable_backward_prefetch = any_manual_prefetch_target and kwargs.pop("enable_backward_prefetch", True)
+    if enable_forward_prefetch or enable_backward_prefetch:
         blocks = [pair[1][0] for pair in layer_pairs_list]  # all target modules
-        next_blocks = blocks[1:] + [None]
-        for current_block, next_block in zip(blocks, next_blocks):
-            if next_block is not None:
-                prefetch_modules = next_block._fsdp_modules
-                # prefetch in order of attn, gate, experts
-                current_block.set_modules_to_forward_prefetch(list(reversed(prefetch_modules)))
 
-        # configure backward prefetch
-        rev_blocks = list(reversed(blocks))
-        prev_blocks = rev_blocks[1:] + [None]
-        for current_block, prev_block in zip(rev_blocks, prev_blocks):
-            if prev_block is not None:
-                prefetch_modules = prev_block._fsdp_modules
-                current_block.set_modules_to_backward_prefetch(list(reversed(prefetch_modules)))
+        if enable_forward_prefetch:
+            next_blocks = blocks[1:] + [None]
+            for current_block, next_block in zip(blocks, next_blocks):
+                if next_block is not None:
+                    prefetch_modules = next_block._fsdp_modules
+                    # prefetch in order of attn, gate, experts
+                    current_block.set_modules_to_forward_prefetch(list(reversed(prefetch_modules)))
+
+        if enable_backward_prefetch:
+            # Configure per-nested-FSDP-group backward prefetch.
+            #
+            # FSDP2's default backward prefetch relies on a dynamic
+            # ``post_forward_order`` that is rewritten during activation
+            # checkpointing recomputation. With nested FSDP groups (e.g. MoE
+            # experts inside a decoder layer), that dynamic order can prefetch
+            # the wrong expert group; its all-gather buffer then persists
+            # until the end of backward and causes severe memory bloat.
+            #
+            # Instead, explicitly pair each nested FSDP module in layer ``i``
+            # with the same-index module in layer ``i-1``:
+            #   decoder[i] -> decoder[i-1], expert[i] -> expert[i-1]
+            # This gives a stable, topology-driven prefetch target.
+            prev_blocks = [None] + blocks[:-1]
+            for current_block, prev_block in zip(blocks, prev_blocks):
+                if prev_block is None:
+                    continue
+                curr_modules = current_block._fsdp_modules
+                prev_modules = prev_block._fsdp_modules
+                if len(curr_modules) != len(prev_modules):
+                    logger.warning_rank0(
+                        "Cannot configure per-group backward prefetch for %s: "
+                        "expected %d nested FSDP modules in the previous block but found %d. "
+                        "Skipping backward prefetch.",
+                        current_block,
+                        len(prev_modules),
+                        len(curr_modules),
+                    )
+                    continue
+                for curr_mod, prev_mod in zip(curr_modules, prev_modules):
+                    curr_mod.set_modules_to_backward_prefetch([prev_mod])
 
     # Handle meta initialization for FSDP2 (fallback if pre-load not done)
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"

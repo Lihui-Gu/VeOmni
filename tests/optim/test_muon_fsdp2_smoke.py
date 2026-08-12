@@ -90,6 +90,7 @@ def _distributed_smoke(use_zero_comm: bool) -> None:
         basic_modules=[],
         enable_reentrant=False,
         enable_forward_prefetch=True,
+        enable_backward_prefetch=True,
         broadcast_model_weights_from_rank0=False,
         max_load_broadcast_size=int(1e9),
         muon_expert_zero_comm=use_zero_comm,
