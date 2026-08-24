@@ -176,6 +176,7 @@ Core files:
    - Create accelerator streams and events through `get_torch_device()`; generic `torch.Stream(device="npu")` is not compatible with torch-npu 2.10 events.
    - Allocate the restored NPU tensor and enqueue its H2D copy on the same prefetch stream. Allocating on the compute stream and writing from another stream can expose incomplete data to autograd.
    - At the NPU consumption point, synchronize the recorded H2D event. `Stream.wait_event()` alone is not a sufficient consumer barrier with torch-npu 2.10. CUDA keeps the non-blocking stream-wait path.
+   - Autograd owns packed activation handles. With prefetch disabled, the runtime must not retain them; with prefetch enabled, remove each module's lookup entry when that module enters backward. Keeping handles until the entire backward finishes also keeps restored device tensors alive and can cause NPU OOM.
 
 ## Trainer Extensions
 

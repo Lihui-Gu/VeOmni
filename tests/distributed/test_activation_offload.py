@@ -298,6 +298,16 @@ class _RuntimeToyModel(nn.Module):
         return x
 
 
+class _MultiOutputSelectedBlock(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.first = nn.Linear(4, 4)
+        self.second = nn.Linear(4, 4)
+
+    def forward(self, x):
+        return self.first(x), {"nested": self.second(x)}
+
+
 def _make_offload_config(
     enable_activation: bool = True,
     activation_gpu_limit: float = 0.0,
@@ -579,7 +589,7 @@ def test_selective_runtime_prefetch_is_idempotent():
     x = torch.randn(2, 4, requires_grad=True)
     with runtime.forward_context:
         y = model(x)
-    handles = list(runtime._handles)
+    handles = [handle for call_handles in runtime._handles_by_call_id.values() for handle in call_handles]
 
     loss = y.sum()
     with runtime.backward_context:
@@ -590,8 +600,7 @@ def test_selective_runtime_prefetch_is_idempotent():
     assert runtime.stats.num_prefetch_hits > 0
 
     # All handles should be device-ready and released from the runtime's
-    # per-step indexes after backward.
-    assert runtime._handles == []
+    # prefetch index after backward.
     assert runtime._handles_by_call_id == {}
     for handle in handles:
         assert handle.state.name == "DEVICE_READY"
@@ -618,13 +627,86 @@ def test_selective_runtime_releases_per_step_handles():
         model_input = torch.randn(2, 4, requires_grad=True)
         with runtime.forward_context:
             output = model(model_input)
-        assert runtime._handles
         with runtime.backward_context:
             output.sum().backward()
-        assert runtime._handles == []
         assert runtime._handles_by_call_id == {}
         assert runtime._forward_order == []
         assert runtime._current_pinned_bytes == 0
+
+    runtime.close()
+
+
+def test_selective_runtime_without_prefetch_does_not_retain_handles():
+    model = _RuntimeToyModel()
+    runtime = build_activation_offload_runtime(
+        model,
+        _make_offload_config(
+            selection_module_classes=["_SelectedLinear", "_OtherLinear"],
+            prefetch=False,
+        ),
+    )
+
+    model_input = torch.randn(2, 4, requires_grad=True)
+    with runtime.forward_context:
+        output = model(model_input)
+
+    # Autograd owns the packed handles. Without prefetch there is no reason
+    # for the runtime to keep an additional strong reference to them.
+    assert runtime._handles_by_call_id == {}
+
+    with runtime.backward_context:
+        output.sum().backward()
+    assert model_input.grad is not None
+    runtime.close()
+
+
+def test_selective_runtime_prefetch_releases_call_index_at_backward_boundary():
+    model = _RuntimeToyModel()
+    runtime = build_activation_offload_runtime(
+        model,
+        _make_offload_config(
+            selection_module_classes=["_SelectedLinear", "_OtherLinear"],
+            prefetch=True,
+        ),
+    )
+
+    model_input = torch.randn(2, 4, requires_grad=True)
+    with runtime.forward_context:
+        output = model(model_input)
+
+    first_call_id, second_call_id = runtime._forward_order
+    assert set(runtime._handles_by_call_id) == {first_call_id, second_call_id}
+
+    # Real autograd hooks release each module's lookup entry as backward
+    # reaches it, without relying on finish_backward's final cleanup.
+    output.sum().backward()
+    assert runtime._handles_by_call_id == {}
+    assert runtime.stats.num_prefetch_hits > 0
+
+    runtime.close()
+
+
+def test_selective_runtime_prefetch_hooks_every_nested_output_once():
+    model = _MultiOutputSelectedBlock()
+    runtime = build_activation_offload_runtime(
+        model,
+        _make_offload_config(
+            selection_module_classes=["_MultiOutputSelectedBlock"],
+            prefetch=True,
+        ),
+    )
+
+    model_input = torch.randn(2, 4, requires_grad=True)
+    with runtime.forward_context:
+        first_output, nested_outputs = model(model_input)
+
+    assert runtime._handles_by_call_id
+
+    # The first output is an independent, unused branch. Backward through a
+    # nested non-first output must still release the module's prefetch index.
+    nested_outputs["nested"].sum().backward()
+    assert first_output.grad_fn is not None
+    assert runtime._handles_by_call_id == {}
 
     runtime.close()
 

@@ -15,6 +15,7 @@
 """Selective asynchronous activation offload runtime."""
 
 import weakref
+from collections.abc import Mapping
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -112,7 +113,6 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         self._call_counter = 0
         self._call_stack: List[int] = []
         self._forward_order: List[int] = []
-        self._handles: List[ActivationOffloadHandle] = []
         self._handles_by_call_id: Dict[int, List[ActivationOffloadHandle]] = {}
         self._module_hooks: List[Tuple[nn.Module, Any, Any]] = []
         self._stream_cache = _StreamCache()
@@ -152,24 +152,46 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
             call_id = self._call_stack.pop()
             if not self.prefetch:
                 return
-            output_tensor = self._get_grad_requiring_output(outputs)
-            if output_tensor is not None:
-                output_tensor.register_hook(self._make_output_grad_hook(call_id))
+            output_tensors = self._get_grad_requiring_outputs(outputs)
+            if output_tensors:
+                backward_hook = self._make_output_grad_hook(call_id)
+                for output_tensor in output_tensors:
+                    output_tensor.register_hook(backward_hook)
 
         return hook
 
     @staticmethod
-    def _get_grad_requiring_output(outputs: Any) -> Optional[torch.Tensor]:
-        if isinstance(outputs, torch.Tensor) and outputs.requires_grad:
-            return outputs
-        if isinstance(outputs, (tuple, list)) and outputs:
-            for item in outputs:
-                if isinstance(item, torch.Tensor) and item.requires_grad:
-                    return item
-        return None
+    def _get_grad_requiring_outputs(outputs: Any) -> Tuple[torch.Tensor, ...]:
+        tensors: List[torch.Tensor] = []
+        seen_tensor_ids = set()
+
+        def collect(value: Any) -> None:
+            if isinstance(value, torch.Tensor):
+                if value.requires_grad and id(value) not in seen_tensor_ids:
+                    seen_tensor_ids.add(id(value))
+                    tensors.append(value)
+            elif isinstance(value, Mapping):
+                for item in value.values():
+                    collect(item)
+            elif isinstance(value, (tuple, list)):
+                for item in value:
+                    collect(item)
+
+        collect(outputs)
+        return tuple(tensors)
 
     def _make_output_grad_hook(self, call_id: int):
+        triggered = False
+
         def hook(grad):
+            nonlocal triggered
+            if triggered:
+                return
+            triggered = True
+            # Once this module's backward starts, the scheduler no longer
+            # needs to own its handles. Autograd keeps them alive for any
+            # remaining or repeated unpack calls.
+            self._handles_by_call_id.pop(call_id, None)
             try:
                 idx = self._forward_order.index(call_id)
             except ValueError:
@@ -230,8 +252,8 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
             prefetch_stream=self._stream_cache.get_prefetch_stream(tensor.device),
         )
         handle.offload(tensor)
-        self._handles.append(handle)
-        self._handles_by_call_id.setdefault(call_id, []).append(handle)
+        if self.prefetch:
+            self._handles_by_call_id.setdefault(call_id, []).append(handle)
         self.stats.num_offloaded_tensors += 1
         self.stats.offloaded_bytes += tensor.numel() * tensor.element_size()
         if handle.cpu_tensor is not None:
@@ -265,7 +287,6 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         """Release per-step indexes while keeping call IDs generation-safe."""
         self._call_stack.clear()
         self._forward_order.clear()
-        self._handles.clear()
         self._handles_by_call_id.clear()
 
     # ------------------------------------------------------------------
