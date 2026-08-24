@@ -522,3 +522,76 @@ def test_qwen3_5_gated_deltanet_selective_offload_forward_backward_equivalence(m
         assert offload_runtime.stats.offloaded_bytes == offload_runtime.stats.restored_bytes
     finally:
         offload_runtime.close()
+
+
+def test_selective_runtime_prefetch_is_idempotent():
+    model = _RuntimeToyModel()
+    config = _make_offload_config(
+        selection_module_classes=["_SelectedLinear", "_OtherLinear"],
+        prefetch=True,
+    )
+    runtime = build_activation_offload_runtime(model, config)
+
+    x = torch.randn(2, 4, requires_grad=True)
+    with runtime.forward_context:
+        y = model(x)
+
+    loss = y.sum()
+    with runtime.backward_context:
+        loss.backward()
+
+    # Prefetch should have been triggered when the backward reaches the
+    # second selected module and prefetches the first one.
+    assert runtime.stats.num_prefetch_hits > 0
+
+    # All handles should be in DEVICE_READY state after backward.
+    for handle in runtime._handles:
+        assert handle.state.name == "DEVICE_READY"
+
+    # Calling ensure_device_resident again is a no-op (idempotent).
+    for handle in runtime._handles:
+        restored = handle.ensure_device_resident()
+        assert restored is handle.restored_tensor
+
+    runtime.close()
+
+
+class _NestedInnerLinear(nn.Linear):
+    pass
+
+
+class _NestedOuterModule(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.inner = _NestedInnerLinear(4, 4)
+
+    def forward(self, x):
+        return self.inner(x)
+
+
+class _NestedSelectionModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.outer = _NestedOuterModule()
+
+    def forward(self, x):
+        return self.outer(x)
+
+
+def test_selective_runtime_nested_selection_attaches_to_innermost_module():
+    model = _NestedSelectionModel()
+    config = _make_offload_config(
+        selection_module_classes=["_NestedOuterModule", "_NestedInnerLinear"],
+    )
+    runtime = build_activation_offload_runtime(model, config)
+
+    x = torch.randn(2, 4, requires_grad=True)
+    with runtime.forward_context:
+        y = model(x)
+
+    loss = y.sum()
+    with runtime.backward_context:
+        loss.backward()
+
+    assert x.grad is not None
+    runtime.close()

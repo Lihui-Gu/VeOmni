@@ -15,7 +15,7 @@
 """Selective asynchronous activation offload runtime."""
 
 from contextlib import nullcontext
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -28,7 +28,9 @@ from ..offloading import (
     build_activation_offloading_context,
 )
 from .config import ResolvedModuleSelection, resolve_module_class_selection
+from .handle import ActivationOffloadHandle
 from .stats import ActivationOffloadStats
+from .utils import _StreamCache
 
 
 class BaseActivationOffloadRuntime:
@@ -86,29 +88,12 @@ class ThresholdActivationOffloadRuntime(BaseActivationOffloadRuntime):
         return self.bwd_context
 
 
-class _PackedSelectedTensor:
-    """Placeholder object returned by the selective pack hook.
-
-    Carries enough metadata for the unpack hook to restore the tensor on the
-    original device. In the synchronous first stage this simply stores the CPU
-    copy; later it will hold an async offload handle.
-    """
-
-    __slots__ = ("device", "cpu_tensor", "call_id")
-
-    def __init__(self, device: torch.device, cpu_tensor: torch.Tensor, call_id: int) -> None:
-        self.device = device
-        self.cpu_tensor = cpu_tensor
-        self.call_id = call_id
-
-
 class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
     """Module-class-selective activation offload runtime.
 
-    First-stage implementation: synchronous D2H/H2D via ``tensor.cpu()``.
-    This gives correct numerical behaviour and lets us validate module
-    selection, prefetch scheduling and threshold fallback before introducing
-    dedicated streams and events.
+    Selected saved tensors are copied asynchronously to CPU on a dedicated
+    offload stream and restored on a dedicated prefetch stream. Non-selected
+    tensors fall back to the legacy threshold policy.
     """
 
     def __init__(
@@ -126,7 +111,11 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         self._call_counter = 0
         self._call_stack: List[int] = []
         self._forward_order: List[int] = []
+        self._handles: List[ActivationOffloadHandle] = []
+        self._handles_by_call_id: Dict[int, List[ActivationOffloadHandle]] = {}
         self._module_hooks: List[Tuple[nn.Module, Any, Any]] = []
+        self._stream_cache = _StreamCache()
+        self._current_pinned_bytes = 0
 
         selections = resolve_module_class_selection(
             model,
@@ -193,7 +182,7 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
     # ------------------------------------------------------------------
     # Saved-tensor hooks
     # ------------------------------------------------------------------
-    def pack_hook(self, tensor: torch.Tensor) -> Union[_PackedSelectedTensor, PackedThresholdActivation]:
+    def pack_hook(self, tensor: torch.Tensor) -> Union[ActivationOffloadHandle, PackedThresholdActivation]:
         """Pack a saved tensor for activation offload.
 
         Selected modules are always offloaded; non-selected tensors fall back
@@ -213,9 +202,9 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         self.stats.num_ignored_tensors += 1
         return (policy, tensor.device, tensor)
 
-    def unpack_hook(self, packed: Union[_PackedSelectedTensor, PackedThresholdActivation]) -> torch.Tensor:
+    def unpack_hook(self, packed: Union[ActivationOffloadHandle, PackedThresholdActivation]) -> torch.Tensor:
         """Restore a tensor that was packed by :meth:`pack_hook`."""
-        if isinstance(packed, _PackedSelectedTensor):
+        if isinstance(packed, ActivationOffloadHandle):
             return self._restore_selected(packed)
 
         policy, device, tensor = packed
@@ -225,35 +214,46 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         return tensor.to(device, non_blocking=False)
 
     # ------------------------------------------------------------------
-    # Core offload / restore (synchronous first stage)
+    # Core offload / restore (async via dedicated streams)
     # ------------------------------------------------------------------
     def _current_module_call_id(self) -> Optional[int]:
         if self._call_stack:
             return self._call_stack[-1]
         return None
 
-    def _offload_selected(self, tensor: torch.Tensor, call_id: int) -> _PackedSelectedTensor:
+    def _offload_selected(self, tensor: torch.Tensor, call_id: int) -> ActivationOffloadHandle:
+        handle = ActivationOffloadHandle(
+            tensor,
+            call_id,
+            offload_stream=self._stream_cache.get_offload_stream(tensor.device),
+            prefetch_stream=self._stream_cache.get_prefetch_stream(tensor.device),
+        )
+        handle.offload(tensor)
+        self._handles.append(handle)
+        self._handles_by_call_id.setdefault(call_id, []).append(handle)
         self.stats.num_offloaded_tensors += 1
         self.stats.offloaded_bytes += tensor.numel() * tensor.element_size()
-        return _PackedSelectedTensor(
-            device=tensor.device,
-            cpu_tensor=tensor.cpu(),
-            call_id=call_id,
-        )
+        if handle.cpu_tensor is not None:
+            self._current_pinned_bytes += handle.cpu_tensor.numel() * handle.cpu_tensor.element_size()
+            self.stats.peak_pinned_bytes = max(self.stats.peak_pinned_bytes, self._current_pinned_bytes)
+        return handle
 
-    def _restore_selected(self, packed: _PackedSelectedTensor) -> torch.Tensor:
+    def _restore_selected(self, handle: ActivationOffloadHandle) -> torch.Tensor:
         self.stats.num_ondemand_restores += 1
-        self.stats.restored_bytes += packed.cpu_tensor.numel() * packed.cpu_tensor.element_size()
-        return packed.cpu_tensor.to(packed.device, non_blocking=False)
+        tensor = handle.ensure_device_resident(block=True)
+        self.stats.restored_bytes += tensor.numel() * tensor.element_size()
+        return tensor
 
     def _prefetch_call(self, call_id: int) -> None:
-        """Prefetch the activations belonging to ``call_id``.
+        """Prefetch all activations belonging to ``call_id`` to the device.
 
-        In the synchronous first stage this is a no-op because the tensor is
-        already on the CPU after forward. It becomes meaningful once async
-        D2H/H2D is introduced.
+        The underlying :meth:`ActivationOffloadHandle.ensure_device_resident` is
+        idempotent and called with ``block=False`` so that the prefetch copy is
+        overlapped with the ongoing backward computation.
         """
-        self.stats.num_prefetch_hits += 1
+        for handle in self._handles_by_call_id.get(call_id, ()):
+            handle.ensure_device_resident(block=False)
+            self.stats.num_prefetch_hits += 1
 
     # ------------------------------------------------------------------
     # Runtime interface
@@ -280,3 +280,7 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         self._module_hooks.clear()
         self._call_stack.clear()
         self._forward_order.clear()
+        self._handles.clear()
+        self._handles_by_call_id.clear()
+        self._stream_cache.clear()
+        self._current_pinned_bytes = 0

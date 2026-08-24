@@ -14,6 +14,7 @@
 
 from .config import ResolvedModuleSelection, resolve_module_class_selection
 from .factory import build_activation_offload_runtime
+from .handle import ActivationOffloadHandle
 from .runtime import (
     BaseActivationOffloadRuntime,
     NullActivationOffloadRuntime,
@@ -23,6 +24,7 @@ from .runtime import (
 
 
 __all__ = [
+    "ActivationOffloadHandle",
     "BaseActivationOffloadRuntime",
     "NullActivationOffloadRuntime",
     "ResolvedModuleSelection",
