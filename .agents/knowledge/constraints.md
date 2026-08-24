@@ -177,6 +177,7 @@ Core files:
    - Allocate the restored NPU tensor and enqueue its H2D copy on the same prefetch stream. Allocating on the compute stream and writing from another stream can expose incomplete data to autograd.
    - At the NPU consumption point, synchronize the recorded H2D event. `Stream.wait_event()` alone is not a sufficient consumer barrier with torch-npu 2.10. CUDA keeps the non-blocking stream-wait path.
    - Autograd owns packed activation handles. With prefetch disabled, the runtime must not retain them; with prefetch enabled, remove each module's lookup entry when that module enters backward. Keeping handles until the entire backward finishes also keeps restored device tensors alive and can cause NPU OOM.
+   - Packed handles must snapshot tensor metadata by value. Storing a bound method such as `tensor.stride` indirectly retains the source activation; store `tensor.stride()` instead.
 
 ## Trainer Extensions
 

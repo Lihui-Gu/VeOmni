@@ -1,4 +1,6 @@
+import gc
 import importlib
+import weakref
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -18,6 +20,7 @@ from veomni.arguments import (
     parse_args,
 )
 from veomni.distributed.activation_offload import (
+    ActivationOffloadHandle,
     NullActivationOffloadRuntime,
     SelectiveAsyncActivationOffloadRuntime,
     ThresholdActivationOffloadRuntime,
@@ -347,6 +350,20 @@ def test_build_runtime_returns_selective_with_selection():
     runtime = build_activation_offload_runtime(_RuntimeToyModel(), config)
 
     assert isinstance(runtime, SelectiveAsyncActivationOffloadRuntime)
+
+
+def test_activation_offload_handle_does_not_retain_source_tensor():
+    source = torch.randn(4, 8).transpose(0, 1)
+    source_ref = weakref.ref(source)
+    expected_stride = source.stride()
+
+    handle = ActivationOffloadHandle(source, call_id=0)
+    handle.offload(source)
+    del source
+    gc.collect()
+
+    assert source_ref() is None
+    assert handle.stride == expected_stride
 
 
 def test_build_runtime_fallback_to_threshold_when_gradient_checkpointing():

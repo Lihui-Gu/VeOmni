@@ -52,7 +52,7 @@ class ActivationOffloadHandle:
         self.device = tensor.device
         self.shape = tensor.shape
         self.dtype = tensor.dtype
-        self.stride = tensor.stride
+        self.stride = tensor.stride()
         self.layout = tensor.layout
 
         self.cpu_tensor: Optional[torch.Tensor] = None
