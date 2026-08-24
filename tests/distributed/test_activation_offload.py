@@ -1,4 +1,6 @@
+import importlib
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -28,6 +30,7 @@ from veomni.distributed.offloading import (
     build_activation_offloading_context,
     custom_save_on_cpu,
 )
+from veomni.utils.device import get_device_type, get_torch_device, synchronize
 
 
 class SelectedBlock(nn.Module):
@@ -373,3 +376,149 @@ def test_selective_runtime_offloads_and_restores_selected_tensors():
 
     runtime.log_summary()
     runtime.close()
+
+
+def test_selective_runtime_round_trips_threshold_fallback_metadata():
+    model = _RuntimeToyModel()
+    config = _make_offload_config(
+        activation_gpu_limit=0.0,
+        selection_module_classes=["_SelectedLinear"],
+    )
+    runtime = build_activation_offload_runtime(model, config)
+    tensor = torch.ones(1024)
+
+    packed = runtime.pack_hook(tensor)
+
+    assert isinstance(packed, tuple)
+    assert packed[0] is OffloadPolicy.OFFLOAD
+    assert packed[1] == tensor.device
+    torch.testing.assert_close(runtime.unpack_hook(packed), tensor)
+    runtime.close()
+
+
+@pytest.mark.skipif(get_device_type() == "cpu", reason="Requires a CUDA or NPU accelerator")
+def test_selective_runtime_restores_nonselected_threshold_fallback_to_accelerator():
+    model = _RuntimeToyModel().to(get_device_type())
+    model_input = torch.randn(128, 4, device=get_device_type(), requires_grad=True)
+    runtime = build_activation_offload_runtime(
+        model,
+        _make_offload_config(
+            activation_gpu_limit=0.0,
+            selection_module_classes=["_SelectedLinear"],
+        ),
+    )
+
+    try:
+        with runtime.forward_context:
+            output = model(model_input)
+        output.sum().backward()
+        synchronize()
+        assert model_input.grad is not None
+        assert runtime.stats.num_threshold_fallback_offloads > 0
+    finally:
+        runtime.close()
+
+
+@pytest.mark.skipif(get_device_type() == "cpu", reason="Requires a CUDA or NPU accelerator")
+def test_qwen3_5_gated_deltanet_selective_offload_forward_backward_equivalence(monkeypatch):
+    """Selected Qwen3.5 GDN saved tensors preserve forward and backward numerics."""
+    from veomni.ops.dispatch import OpSlot
+
+    device_type = get_device_type()
+    if device_type == "npu":
+        pytest.importorskip("triton", reason="Qwen3.5 NPU GatedDeltaNet requires triton-ascend")
+        module_suffix = "npu"
+        kernel_impl = "npu"
+    else:
+        pytest.importorskip("fla", reason="Qwen3.5 GPU GatedDeltaNet requires flash-linear-attention")
+        module_suffix = "gpu"
+        kernel_impl = "fla"
+    modeling = importlib.import_module(
+        f"veomni.models.transformers.qwen3_5.generated.patched_modeling_qwen3_5_{module_suffix}"
+    )
+    for slot_name, op_name in (
+        ("veomni_rms_norm_gated", "rms_norm_gated"),
+        ("veomni_causal_conv1d", "causal_conv1d"),
+        ("veomni_chunk_gated_delta_rule", "chunk_gated_delta_rule"),
+    ):
+        slot = OpSlot(op_name, "standard")
+        slot.bind(kernel_impl)
+        monkeypatch.setattr(modeling, slot_name, slot)
+
+    config = SimpleNamespace(
+        hidden_size=256,
+        linear_num_value_heads=2,
+        linear_num_key_heads=2,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        linear_conv_kernel_dim=4,
+        hidden_act="silu",
+        rms_norm_eps=1e-6,
+        dtype=torch.bfloat16,
+    )
+    torch.manual_seed(20260824)
+    get_torch_device().manual_seed_all(20260824)
+    layer = modeling.Qwen3_5GatedDeltaNet(config, layer_idx=0).to(
+        device=device_type,
+        dtype=torch.bfloat16,
+    )
+    layer.train()
+    monkeypatch.setattr(modeling, "get_parallel_state", lambda: SimpleNamespace(ulysses_enabled=False))
+
+    sequence_length = 64
+    model_input = torch.randn(
+        1,
+        sequence_length,
+        config.hidden_size,
+        device=device_type,
+        dtype=torch.bfloat16,
+    )
+    cu_seq_lens = torch.tensor([0, sequence_length], dtype=torch.int32)
+
+    def run(runtime):
+        layer.zero_grad(set_to_none=True)
+        hidden_states = model_input.detach().clone().requires_grad_(True)
+        with runtime.forward_context:
+            output = layer(
+                hidden_states,
+                cu_seq_lens_q=cu_seq_lens,
+                cu_seqlens_list=[0, sequence_length],
+            )
+        loss = output.float().square().mean()
+        with runtime.backward_context:
+            loss.backward()
+        synchronize()
+        parameter_grads = {
+            name: parameter.grad.detach().cpu().clone()
+            for name, parameter in layer.named_parameters()
+            if parameter.grad is not None
+        }
+        return output.detach().cpu(), hidden_states.grad.detach().cpu(), parameter_grads
+
+    baseline_runtime = build_activation_offload_runtime(layer, _make_offload_config(enable_activation=False))
+    baseline_output, baseline_input_grad, baseline_parameter_grads = run(baseline_runtime)
+
+    offload_runtime = build_activation_offload_runtime(
+        layer,
+        _make_offload_config(selection_module_classes=["Qwen3_5GatedDeltaNet"]),
+    )
+    try:
+        offload_output, offload_input_grad, offload_parameter_grads = run(offload_runtime)
+
+        torch.testing.assert_close(offload_output, baseline_output, rtol=0, atol=0)
+        torch.testing.assert_close(offload_input_grad, baseline_input_grad, rtol=5e-3, atol=2e-8)
+        assert offload_parameter_grads.keys() == baseline_parameter_grads.keys()
+        for name, baseline_grad in baseline_parameter_grads.items():
+            torch.testing.assert_close(
+                offload_parameter_grads[name],
+                baseline_grad,
+                rtol=5e-3,
+                atol=2e-8,
+                msg=lambda msg, parameter_name=name: f"{msg}\nGradient mismatch for {parameter_name}",
+            )
+
+        assert offload_runtime.stats.num_offloaded_tensors > 0
+        assert offload_runtime.stats.num_ondemand_restores > 0
+        assert offload_runtime.stats.offloaded_bytes == offload_runtime.stats.restored_bytes
+    finally:
+        offload_runtime.close()

@@ -23,6 +23,7 @@ from torch.autograd.graph import saved_tensors_hooks
 
 from ..offloading import (
     OffloadPolicy,
+    PackedThresholdActivation,
     _ActivationOffloadThresholdPolicy,
     build_activation_offloading_context,
 )
@@ -192,7 +193,7 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
     # ------------------------------------------------------------------
     # Saved-tensor hooks
     # ------------------------------------------------------------------
-    def pack_hook(self, tensor: torch.Tensor) -> Any:
+    def pack_hook(self, tensor: torch.Tensor) -> Union[_PackedSelectedTensor, PackedThresholdActivation]:
         """Pack a saved tensor for activation offload.
 
         Selected modules are always offloaded; non-selected tensors fall back
@@ -205,19 +206,23 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         policy = self.threshold_policy.decide(tensor)
         if policy == OffloadPolicy.OFFLOAD:
             self.stats.num_threshold_fallback_offloads += 1
-            return tensor.cpu()
+            return (policy, tensor.device, tensor.cpu())
         if policy == OffloadPolicy.KEEP_ON_GPU:
             self.stats.num_threshold_keep_on_gpu += 1
-            return tensor
+            return (policy, tensor.device, tensor)
         self.stats.num_ignored_tensors += 1
-        return tensor
+        return (policy, tensor.device, tensor)
 
-    def unpack_hook(self, packed: Any) -> torch.Tensor:
+    def unpack_hook(self, packed: Union[_PackedSelectedTensor, PackedThresholdActivation]) -> torch.Tensor:
         """Restore a tensor that was packed by :meth:`pack_hook`."""
         if isinstance(packed, _PackedSelectedTensor):
             return self._restore_selected(packed)
-        # Legacy threshold fallback / ignored tensors.
-        return packed
+
+        policy, device, tensor = packed
+        self.threshold_policy.release(policy, tensor)
+        if policy in (OffloadPolicy.IGNORE, OffloadPolicy.KEEP_ON_GPU):
+            return tensor
+        return tensor.to(device, non_blocking=False)
 
     # ------------------------------------------------------------------
     # Core offload / restore (synchronous first stage)

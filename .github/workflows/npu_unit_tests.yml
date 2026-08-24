@@ -177,8 +177,16 @@ jobs:
       - name: Run e2e dcp save and load test
         run: |
           uv run --frozen pytest -v -s -x tests/checkpoints/test_trainer_saveload.py
-      - name: Run distributed tests (dummy_forward)
+      - name: Run distributed tests
         run: |
+          # Exact uv sync removes the separately installed Triton-Ascend overlay.
+          # Reinstall it immediately before the Qwen3.5 GDN activation-offload test,
+          # then use --no-sync so uv does not prune it again before pytest starts.
+          (uv pip uninstall triton triton-ascend || true)
+          uv pip install triton==3.2.0
+          uv pip install triton-ascend==3.2.1 --index=https://mirrors.huaweicloud.com/ascend/repos/pypi
+          uv run --no-sync python -c "from triton._C.libtriton import ascend"
+          uv run --no-sync pytest -v -s -x tests/distributed/test_activation_offload.py
           uv run --frozen pytest -v -s -x tests/distributed/test_dummy_forward.py
       - name: Run data tests
         run: |
