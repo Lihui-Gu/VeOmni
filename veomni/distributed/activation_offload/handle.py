@@ -164,6 +164,8 @@ class ActivationOffloadHandle:
             if current_stream is not None:
                 current_stream.wait_event(self._h2d_event)
         if self.restored_tensor is not None:
+            # record_stream tells the allocator that the tensor may still be
+            # used by work on the current stream.
             current_stream = _current_stream(self.device)
             if current_stream is not None:
                 self.restored_tensor.record_stream(current_stream)
