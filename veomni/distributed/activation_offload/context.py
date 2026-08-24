@@ -52,6 +52,9 @@ class _SelectiveBackwardContext:
         return self
 
     def __exit__(self, *exc_info) -> None:
-        if self._hooks is not None:
-            self._hooks.__exit__(*exc_info)
-            self._hooks = None
+        try:
+            if self._hooks is not None:
+                self._hooks.__exit__(*exc_info)
+                self._hooks = None
+        finally:
+            self.runtime.finish_backward()

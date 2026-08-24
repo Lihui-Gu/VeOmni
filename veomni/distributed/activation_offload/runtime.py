@@ -14,6 +14,7 @@
 
 """Selective asynchronous activation offload runtime."""
 
+import weakref
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -234,9 +235,14 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         self.stats.num_offloaded_tensors += 1
         self.stats.offloaded_bytes += tensor.numel() * tensor.element_size()
         if handle.cpu_tensor is not None:
-            self._current_pinned_bytes += handle.cpu_tensor.numel() * handle.cpu_tensor.element_size()
+            pinned_bytes = handle.cpu_tensor.numel() * handle.cpu_tensor.element_size()
+            self._current_pinned_bytes += pinned_bytes
             self.stats.peak_pinned_bytes = max(self.stats.peak_pinned_bytes, self._current_pinned_bytes)
+            weakref.finalize(handle, self._release_pinned_bytes, pinned_bytes)
         return handle
+
+    def _release_pinned_bytes(self, released_bytes: int) -> None:
+        self._current_pinned_bytes = max(0, self._current_pinned_bytes - released_bytes)
 
     def _restore_selected(self, handle: ActivationOffloadHandle) -> torch.Tensor:
         self.stats.num_ondemand_restores += 1
@@ -254,6 +260,13 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         for handle in self._handles_by_call_id.get(call_id, ()):
             handle.ensure_device_resident(block=False)
             self.stats.num_prefetch_hits += 1
+
+    def finish_backward(self) -> None:
+        """Release per-step indexes while keeping call IDs generation-safe."""
+        self._call_stack.clear()
+        self._forward_order.clear()
+        self._handles.clear()
+        self._handles_by_call_id.clear()
 
     # ------------------------------------------------------------------
     # Runtime interface
@@ -278,9 +291,5 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
             pre_handle.remove()
             post_handle.remove()
         self._module_hooks.clear()
-        self._call_stack.clear()
-        self._forward_order.clear()
-        self._handles.clear()
-        self._handles_by_call_id.clear()
+        self.finish_backward()
         self._stream_cache.clear()
-        self._current_pinned_bytes = 0

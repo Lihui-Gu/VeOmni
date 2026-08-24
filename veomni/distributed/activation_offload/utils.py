@@ -18,6 +18,8 @@ from typing import Dict, Optional
 
 import torch
 
+from ...utils.device import get_torch_device
+
 
 class _StreamCache:
     """Lazily creates and caches one offload stream and one prefetch stream
@@ -32,14 +34,14 @@ class _StreamCache:
         if device.type == "cpu":
             return None
         if device not in self._offload_streams:
-            self._offload_streams[device] = torch.Stream(device=device)
+            self._offload_streams[device] = _new_stream(device)
         return self._offload_streams[device]
 
     def get_prefetch_stream(self, device: torch.device) -> Optional[torch.Stream]:
         if device.type == "cpu":
             return None
         if device not in self._prefetch_streams:
-            self._prefetch_streams[device] = torch.Stream(device=device)
+            self._prefetch_streams[device] = _new_stream(device)
         return self._prefetch_streams[device]
 
     def clear(self) -> None:
@@ -49,19 +51,16 @@ class _StreamCache:
 
 def _current_stream(device: torch.device) -> Optional[torch.Stream]:
     """Return the current compute stream for the device, or None for CPU."""
-    if device.type == "cuda":
-        return torch.cuda.current_stream(device)
-    if device.type == "npu":
-        return torch.npu.current_stream(device)
-    return None
+    return None if device.type == "cpu" else get_torch_device().current_stream(device)
+
+
+def _new_stream(device: torch.device) -> torch.Stream:
+    """Create a stream using the accelerator's native implementation."""
+    return get_torch_device().Stream(device=device)
 
 
 def _new_event(device: torch.device) -> Optional[torch.Event]:
     """Create a new event for the device. CPU returns a no-op event."""
     if device.type == "cpu":
         return None
-    if device.type == "cuda":
-        return torch.cuda.Event(enable_timing=False)
-    if device.type == "npu":
-        return torch.npu.Event(enable_timing=False)
-    return torch.Event(enable_timing=False)
+    return get_torch_device().Event(enable_timing=False)

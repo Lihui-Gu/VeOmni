@@ -125,23 +125,18 @@ class ActivationOffloadHandle:
                 self.state = HandleState.HOST_READY
 
             if self.state == HandleState.HOST_READY:
-                self.restored_tensor = torch.empty(
-                    self.shape,
-                    dtype=self.dtype,
-                    layout=self.layout,
-                    device=self.device,
-                )
-
                 if self._prefetch_stream is None or self.device.type == "cpu":
                     # Synchronous H2D.
-                    self.restored_tensor.copy_(self.cpu_tensor, non_blocking=False)
+                    self.restored_tensor = self.cpu_tensor.to(self.device, non_blocking=False)
                     self.state = HandleState.DEVICE_READY
                 else:
-                    # Asynchronous H2D on the prefetch stream.
+                    # Allocate and copy on the same stream. In particular,
+                    # torch-npu cannot safely write from the prefetch stream
+                    # into storage allocated by the compute stream.
                     if self._d2h_event is not None:
                         self._prefetch_stream.wait_event(self._d2h_event)
                     with self._prefetch_stream:
-                        self.restored_tensor.copy_(self.cpu_tensor, non_blocking=True)
+                        self.restored_tensor = self.cpu_tensor.to(self.device, non_blocking=True)
                         self._h2d_event = _new_event(self.device)
                         self._h2d_event.record(self._prefetch_stream)
                     self.state = HandleState.PREFETCH_QUEUED
@@ -161,7 +156,13 @@ class ActivationOffloadHandle:
         """Make the current compute stream wait for H2D, then mark ready."""
         if self._h2d_event is not None:
             current_stream = _current_stream(self.device)
-            if current_stream is not None:
+            if self.device.type == "npu":
+                # torch-npu 2.10 does not reliably order the consumer through
+                # Stream.wait_event(), so synchronize the copy event at the
+                # point of use. Prefetched copies still run asynchronously
+                # until their activation is requested by autograd.
+                self._h2d_event.synchronize()
+            elif current_stream is not None:
                 current_stream.wait_event(self._h2d_event)
         if self.restored_tensor is not None:
             # record_stream tells the allocator that the tensor may still be

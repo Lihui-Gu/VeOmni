@@ -172,17 +172,22 @@ Core files:
    - Use `get_device_type()`, `get_torch_device()`, `synchronize()`, `empty_cache()` instead of direct `torch.cuda.*` calls.
    - Direct CUDA calls break NPU compatibility.
 
+24. **NPU asynchronous host transfers require native, allocation-owning streams**
+   - Create accelerator streams and events through `get_torch_device()`; generic `torch.Stream(device="npu")` is not compatible with torch-npu 2.10 events.
+   - Allocate the restored NPU tensor and enqueue its H2D copy on the same prefetch stream. Allocating on the compute stream and writing from another stream can expose incomplete data to autograd.
+   - At the NPU consumption point, synchronize the recorded H2D event. `Stream.wait_event()` alone is not a sufficient consumer barrier with torch-npu 2.10. CUDA keeps the non-blocking stream-wait path.
+
 ## Trainer Extensions
 
-24. **Trainer callback lifecycle changes must cover composed trainers**
+25. **Trainer callback lifecycle changes must cover composed trainers**
    - `TextDPOTrainer` and `DiTTrainer` compose a `BaseTrainer` and override `forward_backward_step()`; they do not inherit the base implementation.
    - Lifecycle work added only inside `BaseTrainer.forward_backward_step()` is skipped by these trainers. Update every supported override or reject the unsupported trainer explicitly.
 
-25. **Module-level OpSlots are shared by every model instance**
+26. **Module-level OpSlots are shared by every model instance**
    - Modeling modules expose `OpSlot` objects such as `veomni_causal_lm_loss` as globals. Policy/reference models in DPO can therefore use the same slot.
    - Temporary interception must use forward-scoped ownership and reference-counted dispatch. A closure bound to one model or callback can observe another model's forward and corrupt side-channel state.
 
-26. **DCP full resume skips HF weight materialization**
+27. **DCP full resume skips HF weight materialization**
     - When `train.checkpoint.load_path` is set and the run is not LoRA/PEFT, `BaseTrainer` / omni train pass `skip_weights_load=True` into `build_parallelize_model` / `parallelize_model_fsdp2`.
     - The model is only `to_empty()`-materialized; parameters are restored by DCP in `CheckpointerCallback.on_train_begin`.
     - LoRA/PEFT must not set `skip_weights_load` (and the FSDP2 path raises if both are set): LoRA DCP is trainable-only and still needs the HF base from `model.model_path`.
@@ -190,5 +195,5 @@ Core files:
 
 ## Environment Reproducibility
 
-27. **Exact uv synchronization removes separately installed overlays**
+28. **Exact uv synchronization removes separately installed overlays**
     - The MagiAttention SM90 CUTLASS overlay is installed by `scripts/kernel/install_magi_sm90.sh` after the locked GPU environment. Reinstall it after a later exact `uv sync` before running MagiAttention on SM90.

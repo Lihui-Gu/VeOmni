@@ -419,6 +419,50 @@ def test_selective_runtime_restores_nonselected_threshold_fallback_to_accelerato
         runtime.close()
 
 
+class _AsyncToyBlock(nn.Module):
+    def forward(self, hidden_states):
+        for _ in range(4):
+            hidden_states = torch.sin(hidden_states)
+        return hidden_states
+
+
+@pytest.mark.skipif(get_device_type() == "cpu", reason="Requires a CUDA or NPU accelerator")
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_selective_async_runtime_preserves_multi_block_gradients(prefetch):
+    model = nn.Sequential(*(_AsyncToyBlock() for _ in range(4))).to(get_device_type())
+    torch.manual_seed(20260824)
+    get_torch_device().manual_seed_all(20260824)
+    model_input = torch.randn(1024, 1024, device=get_device_type(), dtype=torch.bfloat16)
+
+    def run(runtime):
+        hidden_states = model_input.detach().clone().requires_grad_(True)
+        with runtime.forward_context:
+            output = model(hidden_states)
+        with runtime.backward_context:
+            output.float().square().mean().backward()
+        synchronize()
+        return output.detach().cpu(), hidden_states.grad.detach().cpu()
+
+    baseline_runtime = build_activation_offload_runtime(model, _make_offload_config(enable_activation=False))
+    baseline_output, baseline_grad = run(baseline_runtime)
+    offload_runtime = build_activation_offload_runtime(
+        model,
+        _make_offload_config(
+            selection_module_classes=["_AsyncToyBlock"],
+            prefetch=prefetch,
+        ),
+    )
+    try:
+        offload_output, offload_grad = run(offload_runtime)
+        torch.testing.assert_close(offload_output, baseline_output, rtol=0, atol=0)
+        torch.testing.assert_close(offload_grad, baseline_grad, rtol=0, atol=0)
+        assert offload_runtime.stats.num_offloaded_tensors > 0
+        if prefetch:
+            assert offload_runtime.stats.num_prefetch_hits > 0
+    finally:
+        offload_runtime.close()
+
+
 @pytest.mark.skipif(get_device_type() == "cpu", reason="Requires a CUDA or NPU accelerator")
 def test_qwen3_5_gated_deltanet_selective_offload_forward_backward_equivalence(monkeypatch):
     """Selected Qwen3.5 GDN saved tensors preserve forward and backward numerics."""
@@ -535,6 +579,7 @@ def test_selective_runtime_prefetch_is_idempotent():
     x = torch.randn(2, 4, requires_grad=True)
     with runtime.forward_context:
         y = model(x)
+    handles = list(runtime._handles)
 
     loss = y.sum()
     with runtime.backward_context:
@@ -544,15 +589,80 @@ def test_selective_runtime_prefetch_is_idempotent():
     # second selected module and prefetches the first one.
     assert runtime.stats.num_prefetch_hits > 0
 
-    # All handles should be in DEVICE_READY state after backward.
-    for handle in runtime._handles:
+    # All handles should be device-ready and released from the runtime's
+    # per-step indexes after backward.
+    assert runtime._handles == []
+    assert runtime._handles_by_call_id == {}
+    for handle in handles:
         assert handle.state.name == "DEVICE_READY"
 
     # Calling ensure_device_resident again is a no-op (idempotent).
-    for handle in runtime._handles:
+    for handle in handles:
         restored = handle.ensure_device_resident()
         assert restored is handle.restored_tensor
 
+    runtime.close()
+
+
+def test_selective_runtime_releases_per_step_handles():
+    model = _RuntimeToyModel()
+    runtime = build_activation_offload_runtime(
+        model,
+        _make_offload_config(
+            selection_module_classes=["_SelectedLinear", "_OtherLinear"],
+            prefetch=True,
+        ),
+    )
+
+    for _ in range(2):
+        model_input = torch.randn(2, 4, requires_grad=True)
+        with runtime.forward_context:
+            output = model(model_input)
+        assert runtime._handles
+        with runtime.backward_context:
+            output.sum().backward()
+        assert runtime._handles == []
+        assert runtime._handles_by_call_id == {}
+        assert runtime._forward_order == []
+        assert runtime._current_pinned_bytes == 0
+
+    runtime.close()
+
+
+def test_selective_runtime_retained_graph_does_not_collide_with_next_step():
+    model = _RuntimeToyModel()
+    runtime = build_activation_offload_runtime(
+        model,
+        _make_offload_config(
+            selection_module_classes=["_SelectedLinear", "_OtherLinear"],
+            prefetch=True,
+        ),
+    )
+
+    first_input = torch.randn(2, 4, requires_grad=True)
+    with runtime.forward_context:
+        first_output = model(first_input)
+    first_loss = first_output.sum()
+    first_call_ids = set(runtime._handles_by_call_id)
+    with runtime.backward_context:
+        first_loss.backward(retain_graph=True)
+
+    second_input = torch.randn(2, 4, requires_grad=True)
+    with runtime.forward_context:
+        second_output = model(second_input)
+    second_call_ids = set(runtime._handles_by_call_id)
+    assert first_call_ids.isdisjoint(second_call_ids)
+
+    with runtime.backward_context:
+        second_output.sum().backward()
+    assert second_input.grad is not None
+
+    # A later backward through the retained graph must not reuse call IDs or
+    # prefetch handles belonging to a newer forward generation.
+    prefetch_hits = runtime.stats.num_prefetch_hits
+    with runtime.backward_context:
+        first_loss.backward()
+    assert runtime.stats.num_prefetch_hits == prefetch_hits
     runtime.close()
 
 
