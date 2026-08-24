@@ -55,6 +55,7 @@ def _resolve_hdfs_path(path: Optional[str]) -> Optional[str]:
 #   │   ├── fsdp_config.*    → FSDPConfig
 #   │   |   └── mixed_precision.* → MixedPrecisionConfig
 #   │   └── offload_config.* → OffloadConfig
+#   │       └── selection.*  → ActivationOffloadSelectionConfig
 #   └── checkpoint.*         → CheckpointConfig
 #
 
@@ -484,6 +485,22 @@ class FSDPConfig:
 
 
 @dataclass
+class ActivationOffloadSelectionConfig:
+    """train.accelerator.offload_config.selection.* — Selective activation-offload targets."""
+
+    module_classes: List[str] = field(
+        default_factory=list,
+        metadata={"help": "Exact module class names whose saved tensors should always be offloaded."},
+    )
+
+    def __post_init__(self):
+        if not self.module_classes:
+            raise ValueError("offload_config.selection.module_classes must contain at least one module class name.")
+        if any(not name or name != name.strip() for name in self.module_classes):
+            raise ValueError("offload_config.selection.module_classes must contain non-empty, trimmed class names.")
+
+
+@dataclass
 class OffloadConfig:
     """train.accelerator.offload_config.* — Activation offload settings."""
 
@@ -496,6 +513,14 @@ class OffloadConfig:
         metadata={
             "help": "When enabling activation offload, `activation_gpu_limit` GB activations are allowed to reserve on GPU."
         },
+    )
+    selection: Optional[ActivationOffloadSelectionConfig] = field(
+        default=None,
+        metadata={"help": "Optional module-class selection for asynchronous activation offload."},
+    )
+    prefetch: bool = field(
+        default=False,
+        metadata={"help": "Prefetch the next selected module's activations during backward."},
     )
 
 
@@ -807,6 +832,7 @@ class TrainingArguments:
         self.world_size = int(os.getenv("WORLD_SIZE", 1))
 
         self._validate_accelerator()
+        self._validate_activation_offload()
         self._derive_batch_config()
         self._resolve_checkpoint_paths()
         self._resolve_profile()
@@ -876,6 +902,24 @@ class TrainingArguments:
             "train.ep_sharded_stream_load requires train.broadcast_model_weights_from_rank0=False "
             "(it reads each rank's ExtraParallel slice directly and cannot run on the broadcast path)."
         )
+
+    def _validate_activation_offload(self):
+        offload = self.accelerator.offload_config
+        if not offload.enable_activation or offload.selection is None:
+            return
+
+        if self.gradient_checkpointing.enable:
+            logger.warning_rank0(
+                "Activation-offload module selection and prefetch are ignored when gradient checkpointing is enabled; "
+                "falling back to the legacy threshold activation-offload path."
+            )
+            return
+
+        if self.torch_compile.enable:
+            raise ValueError(
+                "Selective activation offload is not supported with train.torch_compile.enable=True. "
+                "Disable torch.compile or remove offload_config.selection."
+            )
 
     def _derive_batch_config(self):
         acc = self.accelerator

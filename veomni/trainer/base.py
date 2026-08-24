@@ -56,9 +56,9 @@ from ..data import (
 from ..data.chat_template import ChatTemplate
 from ..data.data_collator import DataCollator, MainCollator
 from ..data.data_transform import build_data_transform
+from ..distributed.activation_offload import build_activation_offload_runtime
 from ..distributed.chunk_mbs import build_chunk_mbs_ranges, chunk_mbs_context
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
-from ..distributed.offloading import build_activation_offloading_context
 from ..distributed.parallel_state import clear_parallel_state, init_parallel_state, use_parallel_state
 from ..distributed.torch_compile import CompileConfig, mark_compile_step_begin
 from ..distributed.torch_parallelize import build_parallelize_model
@@ -628,12 +628,15 @@ class BaseTrainer(Stateful, ABC):
         )
 
     def _build_training_context(self):
-        """Build training context for distributed training."""
-        self.model_fwd_context, self.model_bwd_context = build_activation_offloading_context(
-            self.args.train.accelerator.offload_config.enable_activation,
-            self.args.train.gradient_checkpointing.enable,
-            self.args.train.accelerator.offload_config.activation_gpu_limit,
+        """Build activation offload runtime for distributed training."""
+        self.activation_offload_runtime = build_activation_offload_runtime(
+            model=self.model,
+            offload_config=self.args.train.accelerator.offload_config,
+            enable_gradient_checkpointing=self.args.train.gradient_checkpointing.enable,
+            enable_compile=self.args.train.torch_compile.enable,
         )
+        self.model_fwd_context = self.activation_offload_runtime.forward_context
+        self.model_bwd_context = self.activation_offload_runtime.backward_context
 
     def _init_callbacks(self):
         """Initialize callbacks."""
@@ -676,6 +679,9 @@ class BaseTrainer(Stateful, ABC):
             callback.on_train_begin(self.state)
 
     def on_train_end(self):
+        if hasattr(self, "activation_offload_runtime") and self.activation_offload_runtime is not None:
+            self.activation_offload_runtime.log_summary()
+            self.activation_offload_runtime.close()
         for callback in self._callbacks:
             callback.on_train_end(self.state)
 

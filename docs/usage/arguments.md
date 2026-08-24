@@ -473,6 +473,32 @@ validation instead of applying ChunkMBS to multiple stacks.
 | --- | --- | --- | --- |
 | enable_activation | `bool` | `False` | Enable activation offload to CPU. |
 | activation_gpu_limit | `float` | `0.0` | GB of activations allowed to remain on GPU. |
+| selection | `Optional[ActivationOffloadSelectionConfig]` | `None` | Optional module-class selection for asynchronous activation offload. |
+| prefetch | `bool` | `False` | Prefetch the next selected module's activations during backward. |
+
+Without `selection`, `enable_activation: true` retains the existing threshold-based behavior. When gradient
+checkpointing is enabled, module selection and prefetch are ignored with a warning and the threshold path remains
+active. Selective activation offload is not supported together with `torch.compile`.
+
+### ActivationOffloadSelectionConfig
+
+`train.accelerator.offload_config.selection.*` — Selective activation-offload targets.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| module_classes | `list[str]` | `[]` | Exact module class names whose saved tensors should always be offloaded. |
+
+```yaml
+train:
+  accelerator:
+    offload_config:
+      enable_activation: true
+      activation_gpu_limit: 2.0
+      selection:
+        module_classes:
+          - Qwen3_5GatedDeltaNet
+      prefetch: true
+```
 
 ### CheckpointConfig
 

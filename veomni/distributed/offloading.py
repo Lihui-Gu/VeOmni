@@ -29,21 +29,51 @@ class OffloadPolicy(enum.Enum):
     IGNORE = 2
 
 
+PackedThresholdActivation = Tuple[OffloadPolicy, torch.device, torch.Tensor]
+
+
+class _ActivationOffloadThresholdPolicy:
+    """Choose how eligible tensors interact with the legacy GPU budget."""
+
+    def __init__(self, gpu_limit_in_gb: float = 0, min_offload_size: int = 1024) -> None:
+        self.cur_gpu_ram_in_mb = 0.0
+        self.gpu_limit_in_mb = gpu_limit_in_gb * 1024
+        self.min_offload_size = min_offload_size
+
+    def decide(self, tensor: torch.Tensor, is_param: bool = False) -> OffloadPolicy:
+        tensor_num_bytes = tensor.element_size() * tensor.nelement()
+        # heuristic to skip nn.Linear.weight
+        if is_param or type(tensor.grad_fn).__name__ == "TBackward0" or tensor_num_bytes <= self.min_offload_size:
+            return OffloadPolicy.IGNORE
+
+        # Keep the historical boundary behavior: the tensor that crosses the
+        # configured limit remains resident, and subsequent tensors offload.
+        if self.cur_gpu_ram_in_mb < self.gpu_limit_in_mb:
+            self.cur_gpu_ram_in_mb += tensor_num_bytes / 1024 / 1024
+            return OffloadPolicy.KEEP_ON_GPU
+
+        return OffloadPolicy.OFFLOAD
+
+    def release(self, offload_policy: OffloadPolicy, tensor: torch.Tensor) -> None:
+        if offload_policy == OffloadPolicy.KEEP_ON_GPU:
+            tensor_num_bytes = tensor.element_size() * tensor.nelement()
+            self.cur_gpu_ram_in_mb -= tensor_num_bytes / 1024 / 1024
+
+
 class custom_save_on_cpu(saved_tensors_hooks):
     def __init__(self, gpu_limit_in_gb: float = 0, pin_memory: bool = False, min_offload_size: int = 1024) -> None:
-        self.cur_gpu_ram_in_mb = 0.0
+        self.policy = _ActivationOffloadThresholdPolicy(
+            gpu_limit_in_gb=gpu_limit_in_gb,
+            min_offload_size=min_offload_size,
+        )
+        self.pin_memory = pin_memory
 
-        def pack_to_cpu(tensor: torch.Tensor) -> Tuple[OffloadPolicy, torch.device, torch.Tensor]:
-            tensor_num_bytes = tensor.element_size() * tensor.nelement()
-            # heuristic to skip nn.Linear.weight
-            if type(tensor.grad_fn).__name__ == "TBackward0" or tensor_num_bytes <= min_offload_size:
-                return (OffloadPolicy.IGNORE, tensor.device, tensor)
+        def pack_to_cpu(tensor: torch.Tensor) -> PackedThresholdActivation:
+            offload_policy = self.policy.decide(tensor)
+            if offload_policy in (OffloadPolicy.IGNORE, OffloadPolicy.KEEP_ON_GPU):
+                return (offload_policy, tensor.device, tensor)
 
-            if self.cur_gpu_ram_in_mb < gpu_limit_in_gb * 1024:
-                self.cur_gpu_ram_in_mb += tensor_num_bytes / 1024 / 1024
-                return (OffloadPolicy.KEEP_ON_GPU, tensor.device, tensor)
-
-            if not pin_memory:
+            if not self.pin_memory:
                 return (OffloadPolicy.OFFLOAD, tensor.device, tensor.cpu())
 
             packed = torch.empty(
@@ -55,19 +85,19 @@ class custom_save_on_cpu(saved_tensors_hooks):
             packed.copy_(tensor)
             return (OffloadPolicy.OFFLOAD, tensor.device, packed)
 
-        def unpack_from_cpu(packed: Tuple[OffloadPolicy, torch.device, torch.Tensor]) -> torch.Tensor:
+        def unpack_from_cpu(packed: PackedThresholdActivation) -> torch.Tensor:
             offload_policy, device, tensor = packed
-
-            if offload_policy == OffloadPolicy.IGNORE:
+            self.policy.release(offload_policy, tensor)
+            if offload_policy in (OffloadPolicy.IGNORE, OffloadPolicy.KEEP_ON_GPU):
                 return tensor
-            elif offload_policy == OffloadPolicy.KEEP_ON_GPU:
-                tensor_num_bytes = tensor.element_size() * tensor.nelement()
-                self.cur_gpu_ram_in_mb -= tensor_num_bytes / 1024 / 1024
-                return tensor
-            else:
-                return tensor.to(device, non_blocking=pin_memory)
+            return tensor.to(device, non_blocking=self.pin_memory)
 
         super().__init__(pack_to_cpu, unpack_from_cpu)
+
+    @property
+    def cur_gpu_ram_in_mb(self) -> float:
+        """Expose the legacy accounting attribute for compatibility."""
+        return self.policy.cur_gpu_ram_in_mb
 
 
 def build_activation_offloading_context(
