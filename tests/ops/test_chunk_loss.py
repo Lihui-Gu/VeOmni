@@ -35,6 +35,7 @@ def test_chunk_loss_reuses_valid_token_denominator(monkeypatch):
     assert hidden_states.grad is not None
     assert weights.grad is not None
 
+
 def test_chunk_loss_supports_outer_saved_tensor_hooks(monkeypatch):
     monkeypatch.setattr(chunk_loss_module, "get_parallel_state", lambda: SimpleNamespace(sp_enabled=False))
 
