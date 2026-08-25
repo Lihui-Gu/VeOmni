@@ -65,6 +65,68 @@ Results are written below `output/gc_vs_selective_offload/repro_<timestamp>/`:
 - Logs: `repro_<timestamp>/<case>.log`
 - Resolved configs: `repro_<timestamp>/<case>/veomni_cli.yaml`
 
+## Pending Qwen3.5-9B validation
+
+The confirmed result above does not establish the same performance result on
+Qwen3.5-9B. Run the corresponding three-case text-only experiment directly
+with `train.sh` and the existing Qwen3.5 text config. The commands below avoid
+the expensive whole-Attention/GDN selection and differ only in the settings
+under test.
+
+Upper bound (GC off, activation offload off):
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0,2,4,6 NPROC_PER_NODE=4 \
+bash train.sh tasks/train_text.py configs/text/qwen3_5_sft.yaml \
+  --model.model_path /path/to/Qwen3.5-9B \
+  --model.ops_implementation.rms_norm_gated_implementation npu \
+  --model.ops_implementation.causal_conv1d_implementation npu \
+  --model.ops_implementation.chunk_gated_delta_rule_implementation npu_ascendc \
+  --data.train_path ./tulu-3-sft-mixture/data \
+  --data.max_seq_len 4096 \
+  --train.accelerator.dp_shard_size 4 \
+  --train.micro_batch_size 1 \
+  --train.global_batch_size 16 \
+  --train.max_steps 4 \
+  --train.seed 42 \
+  --train.wandb.enable false \
+  --train.checkpoint.output_dir output/gc_vs_selective_offload/qwen3_5_9b_upper \
+  --train.gradient_checkpointing.enable false \
+  --train.accelerator.offload_config.enable_activation false
+```
+
+GC baseline (GC on, activation offload off): use the same command, change the
+output directory to `qwen3_5_9b_gc`, and replace the final two options with:
+
+```bash
+  --train.gradient_checkpointing.enable true \
+  --train.accelerator.offload_config.enable_activation false
+```
+
+Selective activation offload (GC off): use the same command, change the output
+directory to `qwen3_5_9b_selective`, and replace the final two options with:
+
+```bash
+  --train.gradient_checkpointing.enable false \
+  --train.accelerator.offload_config.enable_activation true \
+  --train.accelerator.offload_config.activation_gpu_limit 80 \
+  --train.accelerator.offload_config.selection.module_classes Qwen3_5RMSNorm \
+  --train.accelerator.offload_config.prefetch false
+```
+
+All three cases use 4 Ascend NPUs, DP4, sequence length 4,096, and four steps.
+If the upper bound does not fit, lower `--data.max_seq_len` consistently for
+all three cases. If the selective summary reports threshold fallback, raise
+`--train.accelerator.offload_config.activation_gpu_limit` before using the run
+as an isolated selective-offload comparison. `train.sh` writes the console log
+to `log.txt`, so preserve or rename it before starting the next case.
+
+Qwen3.5's GatedDeltaNet kernels must be available on the NPU worker. The
+commands use `npu_ascendc`; change
+`--model.ops_implementation.chunk_gated_delta_rule_implementation` to `npu`
+when the external `fla_npu` package is unavailable. This follow-up has a
+reproduction procedure but no confirmed performance result yet.
+
 ## Historical confirmation logs
 
 The measurements above come from these local reference logs. Their names are
