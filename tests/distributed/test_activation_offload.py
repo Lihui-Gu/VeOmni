@@ -13,12 +13,14 @@ from veomni.arguments import (
     AcceleratorConfig,
     ActivationOffloadSelectionConfig,
     GradientCheckpointingConfig,
+    ModuleSelectionConfig,
     OffloadConfig,
     TorchCompileConfig,
     TrainingArguments,
     VeOmniArguments,
     parse_args,
 )
+from veomni.distributed.activation_checkpointing import install_selective_checkpoint_wrappers
 from veomni.distributed.activation_offload import (
     ActivationOffloadHandle,
     NullActivationOffloadRuntime,
@@ -26,7 +28,9 @@ from veomni.distributed.activation_offload import (
     ThresholdActivationOffloadRuntime,
     build_activation_offload_runtime,
     resolve_module_class_selection,
+    resolve_module_selection,
 )
+from veomni.distributed.module_selection import resolve_activation_memory_plan
 from veomni.distributed.offloading import (
     OffloadPolicy,
     _ActivationOffloadThresholdPolicy,
@@ -117,6 +121,74 @@ def test_selective_offload_config_parses_from_cli(monkeypatch):
     offload = args.train.accelerator.offload_config
     assert offload.selection == ActivationOffloadSelectionConfig(module_classes=["SelectedBlock", "OtherBlock"])
     assert offload.prefetch is True
+
+
+def test_hybrid_selection_config_parses_from_yaml(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+model:
+  config_path: dummy
+data:
+  train_path: dummy.jsonl
+train:
+  gradient_checkpointing:
+    enable: true
+    enable_reentrant: false
+    selection:
+      module_paths:
+        - "**.layers.*.mlp"
+  accelerator:
+    offload_config:
+      enable_activation: true
+      selection:
+        module_classes:
+          - SelectedBlock
+        module_paths:
+          - "**.input_layernorm"
+"""
+    )
+    monkeypatch.setattr("sys.argv", ["test", str(config_path)])
+
+    args = parse_args(VeOmniArguments)
+
+    assert args.train.gradient_checkpointing.selection == ModuleSelectionConfig(module_paths=["**.layers.*.mlp"])
+    assert args.train.accelerator.offload_config.selection == ModuleSelectionConfig(
+        module_classes=["SelectedBlock"],
+        module_paths=["**.input_layernorm"],
+    )
+
+
+def test_selective_gradient_checkpointing_requires_enable():
+    with pytest.raises(ValueError, match="requires train.gradient_checkpointing.enable=True"):
+        TrainingArguments(
+            gradient_checkpointing=GradientCheckpointingConfig(
+                enable=False,
+                selection=ModuleSelectionConfig(module_paths=["block"]),
+            )
+        )
+
+
+def test_selective_gradient_checkpointing_rejects_reentrant_mode():
+    with pytest.raises(ValueError, match="requires enable_reentrant=False"):
+        TrainingArguments(
+            gradient_checkpointing=GradientCheckpointingConfig(
+                enable=True,
+                enable_reentrant=True,
+                selection=ModuleSelectionConfig(module_paths=["block"]),
+            )
+        )
+
+
+def test_selective_gradient_checkpointing_rejects_torch_compile():
+    with pytest.raises(ValueError, match="not supported with train.torch_compile.enable"):
+        TrainingArguments(
+            gradient_checkpointing=GradientCheckpointingConfig(
+                enable=True,
+                selection=ModuleSelectionConfig(module_paths=["block"]),
+            ),
+            torch_compile=TorchCompileConfig(enable=True),
+        )
 
 
 def test_legacy_offload_config_parses_without_selection(tmp_path, monkeypatch):
@@ -248,6 +320,84 @@ def test_module_class_selection_ignores_non_module_mixins():
         resolve_module_class_selection(ToyModel(), ["FrameworkMixin"])
 
 
+def test_module_path_selection_uses_segment_aware_globs():
+    model = ToyModel()
+
+    selected = resolve_module_selection(
+        model,
+        ModuleSelectionConfig(module_paths=["**.nested.*"]),
+    )
+
+    assert [item.module_path for item in selected] == ["nested.0", "nested.1"]
+    assert all(item.matched_path_patterns == ("**.nested.*",) for item in selected)
+
+
+def test_module_selection_combines_class_and_path_constraints():
+    model = ToyModel()
+
+    selected = resolve_module_selection(
+        model,
+        ModuleSelectionConfig(
+            module_classes=["SelectedBlock"],
+            module_paths=["nested.*"],
+        ),
+    )
+
+    assert [item.module_path for item in selected] == ["nested.0"]
+
+
+def test_module_selection_rejects_selector_without_final_target():
+    with pytest.raises(ValueError, match="classes: OtherBlock"):
+        resolve_module_selection(
+            ToyModel(),
+            ModuleSelectionConfig(
+                module_classes=["SelectedBlock", "OtherBlock"],
+                module_paths=["first"],
+            ),
+        )
+
+
+class _RegionParent(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.child = _SelectedLinear(4, 4)
+
+    def forward(self, hidden_states):
+        return self.child(hidden_states)
+
+
+class _RegionSelectionModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.block = _RegionParent()
+
+
+def test_activation_memory_plan_rejects_nested_gc_targets():
+    model = _RegionSelectionModel()
+    checkpointing = GradientCheckpointingConfig(
+        enable=True,
+        selection=ModuleSelectionConfig(module_paths=["block", "block.child"]),
+    )
+
+    with pytest.raises(ValueError, match="must not be nested"):
+        resolve_activation_memory_plan(model, checkpointing, OffloadConfig())
+
+
+def test_activation_memory_plan_rejects_gc_offload_overlap():
+    model = _RegionSelectionModel()
+    checkpointing = GradientCheckpointingConfig(
+        enable=True,
+        selection=ModuleSelectionConfig(module_paths=["block.child"]),
+    )
+    offload = OffloadConfig(
+        enable_activation=True,
+        selection=ModuleSelectionConfig(module_paths=["block"]),
+    )
+
+    with pytest.raises(ValueError, match="must not overlap or be nested"):
+        resolve_activation_memory_plan(model, checkpointing, offload)
+
+
 def test_threshold_policy_preserves_legacy_budget_behavior():
     tensor = torch.ones(4, dtype=torch.float32)
     tensor_size_gb = tensor.numel() * tensor.element_size() / 1024**3
@@ -301,6 +451,26 @@ class _RuntimeToyModel(nn.Module):
         return x
 
 
+class _CountingLinear(nn.Linear):
+    def __init__(self, in_features, out_features):
+        super().__init__(in_features, out_features)
+        self.forward_calls = 0
+
+    def forward(self, hidden_states):
+        self.forward_calls += 1
+        return super().forward(hidden_states)
+
+
+class _HybridToyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.checkpointed = _CountingLinear(4, 4)
+        self.offloaded = _CountingLinear(4, 4)
+
+    def forward(self, hidden_states):
+        return self.offloaded(torch.sin(self.checkpointed(hidden_states)))
+
+
 class _MultiOutputSelectedBlock(nn.Module):
     def __init__(self):
         super().__init__()
@@ -315,11 +485,15 @@ def _make_offload_config(
     enable_activation: bool = True,
     activation_gpu_limit: float = 0.0,
     selection_module_classes=None,
+    selection_module_paths=None,
     prefetch: bool = False,
 ):
     selection = None
-    if selection_module_classes:
-        selection = ActivationOffloadSelectionConfig(module_classes=list(selection_module_classes))
+    if selection_module_classes or selection_module_paths:
+        selection = ActivationOffloadSelectionConfig(
+            module_classes=list(selection_module_classes or ()),
+            module_paths=list(selection_module_paths or ()),
+        )
     return OffloadConfig(
         enable_activation=enable_activation,
         activation_gpu_limit=activation_gpu_limit,
@@ -366,6 +540,25 @@ def test_activation_offload_handle_does_not_retain_source_tensor():
     assert handle.stride == expected_stride
 
 
+@pytest.mark.skipif(get_device_type() == "cpu", reason="Requires a CUDA or NPU accelerator")
+def test_activation_offload_handle_restores_after_device_copy_is_released():
+    source = torch.randn(128, 128, device=get_device_type())
+    expected = source.cpu()
+    handle = ActivationOffloadHandle(source, call_id=0)
+    handle.offload(source)
+
+    restored = handle.ensure_device_resident()
+    handle.release_restored_tensor(restored)
+    synchronize()
+    restored_ref = weakref.ref(restored)
+    del restored
+    gc.collect()
+
+    assert restored_ref() is None
+    restored_again = handle.ensure_device_resident()
+    torch.testing.assert_close(restored_again.cpu(), expected)
+
+
 def test_build_runtime_fallback_to_threshold_when_gradient_checkpointing():
     config = _make_offload_config(
         activation_gpu_limit=2.0,
@@ -378,6 +571,23 @@ def test_build_runtime_fallback_to_threshold_when_gradient_checkpointing():
     )
 
     assert isinstance(runtime, ThresholdActivationOffloadRuntime)
+
+
+def test_build_runtime_enables_hybrid_with_resolved_selection():
+    model = _RuntimeToyModel()
+    config = _make_offload_config(selection_module_paths=["selected"])
+    resolved = resolve_module_selection(model, config.selection)
+
+    runtime = build_activation_offload_runtime(
+        model,
+        config,
+        enable_gradient_checkpointing=True,
+        enable_selective_gradient_checkpointing=True,
+        resolved_selection=resolved,
+    )
+
+    assert isinstance(runtime, SelectiveAsyncActivationOffloadRuntime)
+    runtime.close()
 
 
 def test_build_runtime_rejects_selection_with_torch_compile():
@@ -402,6 +612,39 @@ def test_selective_runtime_offloads_and_restores_selected_tensors():
     assert x.grad is not None
 
     runtime.log_summary()
+    runtime.close()
+
+
+def test_hybrid_runtime_recomputes_only_gc_target_and_offloads_sibling():
+    model = _HybridToyModel()
+    checkpointing = GradientCheckpointingConfig(
+        enable=True,
+        selection=ModuleSelectionConfig(module_paths=["checkpointed"]),
+    )
+    config = _make_offload_config(
+        activation_gpu_limit=1024.0,
+        selection_module_paths=["offloaded"],
+    )
+    plan = resolve_activation_memory_plan(model, checkpointing, config)
+    install_selective_checkpoint_wrappers(model, plan.gradient_checkpoint_targets, early_stop=True)
+    runtime = build_activation_offload_runtime(
+        model,
+        config,
+        enable_gradient_checkpointing=True,
+        enable_selective_gradient_checkpointing=True,
+        resolved_selection=plan.activation_offload_targets,
+    )
+
+    hidden_states = torch.randn(2, 4, requires_grad=True)
+    with runtime.forward_context:
+        output = model(hidden_states)
+    with runtime.backward_context:
+        output.sum().backward()
+
+    assert model.checkpointed.forward_calls == 2
+    assert model.offloaded.forward_calls == 1
+    assert runtime.stats.num_offloaded_tensors > 0
+    assert hidden_states.grad is not None
     runtime.close()
 
 
@@ -488,6 +731,32 @@ def test_selective_async_runtime_preserves_multi_block_gradients(prefetch):
             assert offload_runtime.stats.num_prefetch_hits > 0
     finally:
         offload_runtime.close()
+
+
+@pytest.mark.skipif(get_device_type() == "cpu", reason="Requires a CUDA or NPU accelerator")
+def test_selective_runtime_does_not_retain_consumed_device_copies():
+    model = nn.Sequential(*(_AsyncToyBlock() for _ in range(2))).to(get_device_type())
+    runtime = build_activation_offload_runtime(
+        model,
+        _make_offload_config(
+            selection_module_classes=["_AsyncToyBlock"],
+            prefetch=True,
+        ),
+    )
+
+    model_input = torch.randn(128, 128, device=get_device_type(), requires_grad=True)
+    with runtime.forward_context:
+        output = model(model_input)
+    handles = [handle for call_handles in runtime._handles_by_call_id.values() for handle in call_handles]
+
+    with runtime.backward_context:
+        output.sum().backward()
+    synchronize()
+
+    assert handles
+    assert all(handle._restored_tensor is None for handle in handles)
+    assert len(runtime._live_handles) == 0
+    runtime.close()
 
 
 @pytest.mark.skipif(get_device_type() == "cpu", reason="Requires a CUDA or NPU accelerator")
@@ -612,8 +881,8 @@ def test_selective_runtime_prefetch_is_idempotent():
     with runtime.backward_context:
         loss.backward()
 
-    # Prefetch should have been triggered when the backward reaches the
-    # second selected module and prefetches the first one.
+    # Entering backward prefetches the final selected call; the first unpack
+    # from that call then prefetches the preceding call.
     assert runtime.stats.num_prefetch_hits > 0
 
     # All handles should be device-ready and released from the runtime's
@@ -647,6 +916,7 @@ def test_selective_runtime_releases_per_step_handles():
         with runtime.backward_context:
             output.sum().backward()
         assert runtime._handles_by_call_id == {}
+        assert len(runtime._live_handles) == 0
         assert runtime._forward_order == []
         assert runtime._current_pinned_bytes == 0
 
@@ -694,8 +964,8 @@ def test_selective_runtime_prefetch_releases_call_index_at_backward_boundary():
     first_call_id, second_call_id = runtime._forward_order
     assert set(runtime._handles_by_call_id) == {first_call_id, second_call_id}
 
-    # Real autograd hooks release each module's lookup entry as backward
-    # reaches it, without relying on finish_backward's final cleanup.
+    # The first unpack for each module releases its lookup entry without
+    # relying on finish_backward's final cleanup.
     output.sum().backward()
     assert runtime._handles_by_call_id == {}
     assert runtime.stats.num_prefetch_hits > 0
@@ -703,7 +973,7 @@ def test_selective_runtime_prefetch_releases_call_index_at_backward_boundary():
     runtime.close()
 
 
-def test_selective_runtime_prefetch_hooks_every_nested_output_once():
+def test_selective_runtime_prefetch_supports_nested_output_backward():
     model = _MultiOutputSelectedBlock()
     runtime = build_activation_offload_runtime(
         model,
@@ -804,3 +1074,25 @@ def test_selective_runtime_nested_selection_attaches_to_innermost_module():
 
     assert x.grad is not None
     runtime.close()
+
+
+def test_selective_runtime_rejects_nested_selection_with_prefetch():
+    model = _NestedSelectionModel()
+    config = _make_offload_config(
+        selection_module_classes=["_NestedOuterModule", "_NestedInnerLinear"],
+        prefetch=True,
+    )
+
+    with pytest.raises(ValueError, match="prefetch does not support nested module selections"):
+        build_activation_offload_runtime(model, config)
+
+
+def test_selective_runtime_rejects_root_and_child_selection_with_prefetch():
+    model = _NestedSelectionModel()
+    config = _make_offload_config(
+        selection_module_classes=["_NestedSelectionModel", "_NestedInnerLinear"],
+        prefetch=True,
+    )
+
+    with pytest.raises(ValueError, match="prefetch does not support nested module selections"):
+        build_activation_offload_runtime(model, config)

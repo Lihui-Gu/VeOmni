@@ -15,7 +15,7 @@
 
 import types
 from functools import partial
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -30,8 +30,10 @@ from ..arguments import MixedPrecisionConfig
 from ..models import load_model_weights, load_model_weights_ep_sharded, rank0_load_and_broadcast_weights
 from ..utils import logging
 from ..utils.device import IS_NPU_AVAILABLE, get_device_type
+from .activation_checkpointing import install_selective_checkpoint_wrappers
 from .checkpoint import CheckpointFunction
 from .chunk_mbs import apply_chunk_mbs
+from .module_selection import ResolvedModuleSelection
 from .parallel_plan import get_runtime_parallel_plan
 from .parallel_state import get_parallel_state
 from .torch_compile import CompileConfig, compile_decoder_blocks, validate_compile_runtime
@@ -139,6 +141,8 @@ def parallelize_model_fsdp2(
     muon_expert_zero_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
+    selective_checkpoint_targets: Optional[Sequence[ResolvedModuleSelection]] = None,
+    checkpoint_early_stop: bool = True,
     **kwargs,
 ) -> "nn.Module":
     """
@@ -229,6 +233,13 @@ def parallelize_model_fsdp2(
         fqn2spec_info = None
         _extra_parallel_mesh = None
         _extra_parallel_map = None
+
+    if selective_checkpoint_targets is not None:
+        model._veomni_selective_checkpoint_wrappers = install_selective_checkpoint_wrappers(
+            model,
+            selective_checkpoint_targets,
+            early_stop=checkpoint_early_stop,
+        )
 
     # Extract ExtraParallel modules from the target classes if any, then pair them.
     # Regard each target module as a layer.
@@ -597,6 +608,7 @@ def build_parallelize_model(
     muon_expert_zero_comm: bool = False,
     compile_config: Optional[CompileConfig] = None,
     should_skip_hf_weight_load: bool = False,
+    selective_checkpoint_targets: Optional[Sequence[ResolvedModuleSelection]] = None,
     **kwargs,
 ) -> "nn.Module":
     """Apply parallel strategies to the model.
@@ -611,12 +623,26 @@ def build_parallelize_model(
     parallel_state = get_parallel_state()
     compile_config = compile_config or CompileConfig()
     chunk_mbs_config = kwargs.pop("chunk_mbs_config", None)
+    checkpoint_early_stop = kwargs.pop("early_stop", True)
+    use_reentrant = kwargs.pop("enable_reentrant", False)
+
+    if selective_checkpoint_targets is not None:
+        if not enable_gradient_checkpointing:
+            raise ValueError("Selective checkpoint targets require enable_gradient_checkpointing=True.")
+        if not selective_checkpoint_targets:
+            raise ValueError("Selective gradient checkpointing requires at least one resolved target.")
+        if use_reentrant:
+            raise ValueError("Selective gradient checkpointing requires enable_reentrant=False.")
+        if compile_config.enable:
+            raise ValueError("Selective gradient checkpointing is not supported with torch.compile yet.")
 
     if chunk_mbs_config is not None and chunk_mbs_config.enable:
         if compile_config.enable:
             raise ValueError("ChunkMBS is not supported with torch.compile yet.")
-        if enable_gradient_checkpointing and kwargs.get("enable_reentrant", False):
+        if enable_gradient_checkpointing and use_reentrant:
             raise ValueError("ChunkMBS requires non-reentrant gradient checkpointing.")
+        if selective_checkpoint_targets is not None:
+            raise ValueError("ChunkMBS is not supported with selective gradient checkpointing yet.")
 
     if not parallel_state.fsdp_enabled:
         if kwargs.get("init_device") not in ["cuda", "npu"]:
@@ -625,10 +651,12 @@ def build_parallelize_model(
     if mixed_precision.enable:  # upcast to float32 before feed it to optimizer
         model = model.float()
 
-    checkpoint_early_stop = kwargs.pop("early_stop", True)
-    if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
+    if (
+        enable_gradient_checkpointing
+        and selective_checkpoint_targets is None
+        and hasattr(model, "gradient_checkpointing_enable")
+    ):
         logger.info_rank0("Enable gradient checkpointing.")
-        use_reentrant = kwargs.pop("enable_reentrant", False)
         if use_reentrant:
             torch.utils.checkpoint.CheckpointFunction = CheckpointFunction
 
@@ -665,13 +693,27 @@ def build_parallelize_model(
                 muon_expert_zero_comm=muon_expert_zero_comm,
                 compile_config=compile_config,
                 should_skip_hf_weight_load=should_skip_hf_weight_load,
+                selective_checkpoint_targets=selective_checkpoint_targets,
+                checkpoint_early_stop=checkpoint_early_stop,
                 **kwargs,
             )
         else:
             if compile_config.enable:
                 raise RuntimeError("train.torch_compile.enable requires fsdp_mode='fsdp2'; DDP is not supported.")
+            if selective_checkpoint_targets is not None:
+                model._veomni_selective_checkpoint_wrappers = install_selective_checkpoint_wrappers(
+                    model,
+                    selective_checkpoint_targets,
+                    early_stop=checkpoint_early_stop,
+                )
             model = DDP(model, device_ids=[parallel_state.local_rank], process_group=parallel_state.dp_group)
     elif compile_config.enable:
         raise RuntimeError("train.torch_compile.enable requires FSDP2; compile without FSDP is not supported.")
+    elif selective_checkpoint_targets is not None:
+        model._veomni_selective_checkpoint_wrappers = install_selective_checkpoint_wrappers(
+            model,
+            selective_checkpoint_targets,
+            early_stop=checkpoint_early_stop,
+        )
 
     return model

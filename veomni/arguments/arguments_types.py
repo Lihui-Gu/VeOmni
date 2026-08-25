@@ -49,13 +49,14 @@ def _resolve_hdfs_path(path: Optional[str]) -> Optional[str]:
 #   ├── profile.*            → ProfileConfig
 #   ├── channel_loss.*       → ChannelLossConfig
 #   ├── gradient_checkpointing.*  → GradientCheckpointingConfig
+#   │   └── selection.*         → ModuleSelectionConfig
 #   ├── torch_compile.*      → TorchCompileConfig
 #   ├── chunk_mbs_config.*   → ChunkMBSConfig
 #   ├── accelerator.*        → AcceleratorConfig
 #   │   ├── fsdp_config.*    → FSDPConfig
 #   │   |   └── mixed_precision.* → MixedPrecisionConfig
 #   │   └── offload_config.* → OffloadConfig
-#   │       └── selection.*  → ActivationOffloadSelectionConfig
+#   │       └── selection.*  → ModuleSelectionConfig
 #   └── checkpoint.*         → CheckpointConfig
 #
 
@@ -367,6 +368,37 @@ class ChannelLossConfig:
 
 
 @dataclass
+class ModuleSelectionConfig:
+    """Shared module selector for activation checkpointing and offload."""
+
+    module_classes: List[str] = field(
+        default_factory=list,
+        metadata={"help": "Exact implementation class names of selected modules."},
+    )
+    module_paths: List[str] = field(
+        default_factory=list,
+        metadata={
+            "help": (
+                "Glob patterns over logical named-module paths. '*' matches one path segment and '**' matches "
+                "zero or more path segments."
+            )
+        },
+    )
+
+    def __post_init__(self):
+        if not self.module_classes and not self.module_paths:
+            raise ValueError("Module selection must contain at least one module class name or path pattern.")
+        if any(not name or name != name.strip() for name in self.module_classes):
+            raise ValueError("Module selection class names must be non-empty and trimmed.")
+        if any(not pattern or pattern != pattern.strip() for pattern in self.module_paths):
+            raise ValueError("Module selection path patterns must be non-empty and trimmed.")
+
+
+# Backward-compatible Python API for the Stage 1 class-only selector name.
+ActivationOffloadSelectionConfig = ModuleSelectionConfig
+
+
+@dataclass
 class GradientCheckpointingConfig:
     """train.gradient_checkpointing.* — Activation recomputation settings."""
 
@@ -392,6 +424,10 @@ class GradientCheckpointingConfig:
                 "PyTorch ignores this option when enable_reentrant=True."
             )
         },
+    )
+    selection: Optional[ModuleSelectionConfig] = field(
+        default=None,
+        metadata={"help": "Optional module selection for non-reentrant gradient checkpointing."},
     )
 
 
@@ -485,22 +521,6 @@ class FSDPConfig:
 
 
 @dataclass
-class ActivationOffloadSelectionConfig:
-    """train.accelerator.offload_config.selection.* — Selective activation-offload targets."""
-
-    module_classes: List[str] = field(
-        default_factory=list,
-        metadata={"help": "Exact module class names whose saved tensors should always be offloaded."},
-    )
-
-    def __post_init__(self):
-        if not self.module_classes:
-            raise ValueError("offload_config.selection.module_classes must contain at least one module class name.")
-        if any(not name or name != name.strip() for name in self.module_classes):
-            raise ValueError("offload_config.selection.module_classes must contain non-empty, trimmed class names.")
-
-
-@dataclass
 class OffloadConfig:
     """train.accelerator.offload_config.* — Activation offload settings."""
 
@@ -514,9 +534,9 @@ class OffloadConfig:
             "help": "When enabling activation offload, `activation_gpu_limit` GB activations are allowed to reserve on GPU."
         },
     )
-    selection: Optional[ActivationOffloadSelectionConfig] = field(
+    selection: Optional[ModuleSelectionConfig] = field(
         default=None,
-        metadata={"help": "Optional module-class selection for asynchronous activation offload."},
+        metadata={"help": "Optional module class/path selection for asynchronous activation offload."},
     )
     prefetch: bool = field(
         default=False,
@@ -904,11 +924,27 @@ class TrainingArguments:
         )
 
     def _validate_activation_offload(self):
+        checkpointing = self.gradient_checkpointing
         offload = self.accelerator.offload_config
+
+        if checkpointing.selection is not None:
+            if not checkpointing.enable:
+                raise ValueError(
+                    "train.gradient_checkpointing.selection requires train.gradient_checkpointing.enable=True."
+                )
+            if checkpointing.enable_reentrant:
+                raise ValueError("Selective gradient checkpointing requires enable_reentrant=False.")
+            if self.chunk_mbs_config.enable:
+                raise ValueError(
+                    "Selective gradient checkpointing is not supported with train.chunk_mbs_config.enable."
+                )
+            if self.torch_compile.enable:
+                raise ValueError("Selective gradient checkpointing is not supported with train.torch_compile.enable.")
+
         if not offload.enable_activation or offload.selection is None:
             return
 
-        if self.gradient_checkpointing.enable:
+        if checkpointing.enable and checkpointing.selection is None:
             logger.warning_rank0(
                 "Activation-offload module selection and prefetch are ignored when gradient checkpointing is enabled; "
                 "falling back to the legacy threshold activation-offload path."

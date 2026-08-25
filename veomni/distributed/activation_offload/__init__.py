@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .config import ResolvedModuleSelection, resolve_module_class_selection
+from .config import ResolvedModuleSelection, resolve_module_class_selection, resolve_module_selection
 from .factory import build_activation_offload_runtime
 from .handle import ActivationOffloadHandle
 from .runtime import (
@@ -32,4 +32,5 @@ __all__ = [
     "ThresholdActivationOffloadRuntime",
     "build_activation_offload_runtime",
     "resolve_module_class_selection",
+    "resolve_module_selection",
 ]

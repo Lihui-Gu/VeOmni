@@ -394,6 +394,11 @@ distinct from the first emission.
 | debug | `bool` | `False` | Enable [checkpoint debugging](https://docs.pytorch.org/docs/stable/checkpoint.html#torch.utils.checkpoint.set_checkpoint_debug_enabled). |
 | enable_reentrant | `bool` | `False` | Use reentrant gradient checkpointing. |
 | early_stop | `bool` | `True` | Stop non-reentrant checkpoint recomputation as soon as all needed tensors are computed. PyTorch ignores this option when `enable_reentrant=True`. |
+| selection | `Optional[ModuleSelectionConfig]` | `None` | Restrict non-reentrant checkpointing to explicitly selected modules. |
+
+When `selection` is omitted, gradient checkpointing retains the existing model-wide behavior. Selective gradient
+checkpointing requires `enable=true` and `enable_reentrant=false`; it is currently incompatible with ChunkMBS and
+`torch.compile`.
 
 ### ChunkMBSConfig
 
@@ -473,20 +478,27 @@ validation instead of applying ChunkMBS to multiple stacks.
 | --- | --- | --- | --- |
 | enable_activation | `bool` | `False` | Enable activation offload to CPU. |
 | activation_gpu_limit | `float` | `0.0` | GB of activations allowed to remain on GPU. |
-| selection | `Optional[ActivationOffloadSelectionConfig]` | `None` | Optional module-class selection for asynchronous activation offload. |
+| selection | `Optional[ModuleSelectionConfig]` | `None` | Optional module class/path selection for asynchronous activation offload. |
 | prefetch | `bool` | `False` | Prefetch the next selected module's activations during backward. |
 
-Without `selection`, `enable_activation: true` retains the existing threshold-based behavior. When gradient
-checkpointing is enabled, module selection and prefetch are ignored with a warning and the threshold path remains
-active. Selective activation offload is not supported together with `torch.compile`.
+Without `selection`, `enable_activation: true` retains the existing threshold-based behavior. When model-wide
+gradient checkpointing is enabled, module selection and prefetch are ignored with a warning and the threshold path
+remains active. When both GC and offload provide explicit, non-overlapping selections, VeOmni enables hybrid
+selective recomputation and asynchronous offload. Selective activation offload is not supported with `torch.compile`.
 
-### ActivationOffloadSelectionConfig
+### ModuleSelectionConfig
 
-`train.accelerator.offload_config.selection.*` — Selective activation-offload targets.
+Shared by `train.gradient_checkpointing.selection.*` and
+`train.accelerator.offload_config.selection.*`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| module_classes | `list[str]` | `[]` | Exact module class names whose saved tensors should always be offloaded. |
+| module_classes | `list[str]` | `[]` | Exact implementation class names. Values are ORed. |
+| module_paths | `list[str]` | `[]` | Glob patterns over logical module paths. `*` matches one path segment and `**` recursively matches path segments. Values are ORed. |
+
+When both fields are present, a module must satisfy both the class and path constraints. Every configured selector
+must match at least one final target. GC targets may not be nested, shared under multiple paths, or overlap/nest with
+offload targets. Nested offload-only targets are supported with on-demand restore and rejected when `prefetch=true`.
 
 ```yaml
 train:
@@ -499,6 +511,8 @@ train:
           - Qwen3_5GatedDeltaNet
       prefetch: true
 ```
+
+See `configs/multimodal/qwen3_5/qwen3_5_vl_ascendc_hybrid_activation.yaml` for a hybrid selective-GC and offload example.
 
 ### CheckpointConfig
 

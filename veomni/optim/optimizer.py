@@ -381,8 +381,12 @@ def _make_param_groups_for_subset(
 def get_parameter_names(model, forbidden_layer_types, forbidden_param_names):
     forbidden_layer_types = [] if forbidden_layer_types is None else forbidden_layer_types
     forbidden_param_names = [] if forbidden_param_names is None else forbidden_param_names
+    while getattr(model, "_veomni_selective_checkpoint_wrapper", False):
+        model = model._checkpoint_wrapped_module
     result = []
     for name, child in model.named_children():
+        while getattr(child, "_veomni_selective_checkpoint_wrapper", False):
+            child = child._checkpoint_wrapped_module
         child_params = get_parameter_names(child, forbidden_layer_types, forbidden_param_names)
         result += [
             f"{name}.{n}"

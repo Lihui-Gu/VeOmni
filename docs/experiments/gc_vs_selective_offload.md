@@ -55,8 +55,9 @@ MODEL_PATH=./Qwen3-0.6B NPU_DEVICES=0,2 \
   bash scripts/profile/run_gc_vs_selective_offload.sh all
 ```
 
-The script accepts `upper`, `gc`, or `selective` to run one case. Paths and
-launch settings can be overridden with `MODEL_PATH`, `DATA_PATH`,
+The script accepts `upper`, `gc`, `selective`, `selective-gc`, or `hybrid` to
+run one case; `all` runs the Stage 1 trio and `hybrid-all` runs the Stage 2
+comparison. Paths and launch settings can be overridden with `MODEL_PATH`, `DATA_PATH`,
 `OUTPUT_ROOT`, `TORCHRUN_BIN`, `NPU_DEVICES`, `NPROC_PER_NODE`,
 `MASTER_PORT_BASE`, `MAX_STEPS`, and `RUN_TAG`.
 
@@ -65,13 +66,67 @@ Results are written below `output/gc_vs_selective_offload/repro_<timestamp>/`:
 - Logs: `repro_<timestamp>/<case>.log`
 - Resolved configs: `repro_<timestamp>/<case>/veomni_cli.yaml`
 
-## Pending Qwen3.5-9B validation
+## Hybrid GC plus selective-offload result
 
-The confirmed result above does not establish the same performance result on
-Qwen3.5-9B. Run the corresponding three-case text-only experiment directly
-with `train.sh` and the existing Qwen3.5 text config. The commands below avoid
-the expensive whole-Attention/GDN selection and differ only in the settings
-under test.
+The Stage 2 hybrid comparison uses the same Qwen3-0.6B model, dataset,
+sequence length, batch sizes, and DP2 setup as above, but runs six steps. The
+hybrid plan checkpoints every MLP and selectively offloads decoder
+input/post-attention RMSNorm activations. Two independent runs were collected
+for the full-GC baseline and hybrid case.
+
+| Mode | Mean step time | Peak NPU memory |
+|---|---:|---:|
+| Model-wide GC | 9.96 s, 10.20 s | 8.64 GiB |
+| MLP-only GC, offload disabled | 8.80 s | 22.27 GiB |
+| MLP-only GC + selective RMSNorm offload | 8.54 s, 8.56 s | 20.52 GiB |
+
+Compared with model-wide GC, the two-run hybrid mean reduces step latency from
+10.08 s to 8.55 s (15.2%) and increases throughput by 17.9%. It is a
+memory/throughput tradeoff: peak memory increases by 11.88 GiB because
+attention is retained instead of recomputed. The no-offload control shows that
+selective RMSNorm offload recovers 1.75 GiB (7.9%) from the same selective-GC
+plan. The approximately 0.25 s timing difference between those two cases is
+not large enough to attribute an independent speedup to offload.
+
+All loss sequences match: `2.14, 2.31, 2.20, 1.97, 1.88, 1.97`. The hybrid
+run moved 90,308,755,488 bytes per rank in each direction across six steps,
+with 8,064 selected tensors, zero threshold fallback, and 1,882,832,896 bytes
+of peak pinned memory.
+
+Reproduce the three-way comparison with:
+
+```bash
+MAX_STEPS=6 MODEL_PATH=./Qwen3-0.6B NPU_DEVICES=0,2 \
+  bash scripts/profile/run_gc_vs_selective_offload.sh hybrid-all
+```
+
+The individual modes are `gc`, `selective-gc`, and `hybrid`. On the tested
+torch-npu 2.10 stack, backward prefetch was memory-stable after moving its
+scheduling trigger from output tensor hooks to the first saved-tensor unpack,
+but did not improve step time for this selector; the reproduced hybrid case
+therefore keeps `prefetch=false`.
+
+## Qwen3.5-9B validation
+
+The same benefit did not reproduce on Qwen3.5-9B with four Ascend 910B2
+devices, FSDP2 DP4, sequence length 4,096, global/micro batch size 16/1, and
+six steps:
+
+| Mode | Mean step time | Peak NPU memory |
+|---|---:|---:|
+| Model-wide GC | 15.93 s | 48.05 GiB |
+| Attention/GDN/MLP GC + outer-RMSNorm offload | 18.19 s | 49.08 GiB |
+
+The losses match (`1.50, 1.83, 1.87, 1.44, 1.51, 1.25`), but this selector is
+slower and uses more memory. It moved 51,383,275,008 bytes per rank in each
+direction across the six steps. Tests with layer-wise, attention-tail, and
+q/k-norm variants also failed to beat model-wide GC. This negative result is
+important: a selector must be tuned to the model and memory target rather than
+assumed to improve every workload.
+
+The commands below reproduce the separate Stage 1 upper-bound comparison with
+the existing Qwen3.5 text config. They avoid the expensive whole-Attention/GDN
+selection and differ only in the settings under test.
 
 Upper bound (GC off, activation offload off):
 

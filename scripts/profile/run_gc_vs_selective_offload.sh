@@ -98,6 +98,45 @@ case "${MODE}" in
       --train.accelerator.offload_config.selection.module_classes Qwen3RMSNorm \
       --train.accelerator.offload_config.prefetch false
     ;;
+  selective-gc)
+    run_case selective_gc 3 \
+      --train.gradient_checkpointing.enable true \
+      --train.gradient_checkpointing.enable_reentrant false \
+      --train.gradient_checkpointing.selection.module_paths '**.layers.*.mlp' \
+      --train.accelerator.offload_config.enable_activation false
+    ;;
+  hybrid)
+    run_case hybrid 4 \
+      --train.gradient_checkpointing.enable true \
+      --train.gradient_checkpointing.enable_reentrant false \
+      --train.gradient_checkpointing.selection.module_paths '**.layers.*.mlp' \
+      --train.accelerator.offload_config.enable_activation true \
+      --train.accelerator.offload_config.activation_gpu_limit 40 \
+      --train.accelerator.offload_config.selection.module_paths \
+        '**.layers.*.input_layernorm' \
+        '**.layers.*.post_attention_layernorm' \
+      --train.accelerator.offload_config.prefetch false
+    ;;
+  hybrid-all)
+    run_case gc 1 \
+      --train.gradient_checkpointing.enable true \
+      --train.accelerator.offload_config.enable_activation false
+    run_case selective_gc 3 \
+      --train.gradient_checkpointing.enable true \
+      --train.gradient_checkpointing.enable_reentrant false \
+      --train.gradient_checkpointing.selection.module_paths '**.layers.*.mlp' \
+      --train.accelerator.offload_config.enable_activation false
+    run_case hybrid 4 \
+      --train.gradient_checkpointing.enable true \
+      --train.gradient_checkpointing.enable_reentrant false \
+      --train.gradient_checkpointing.selection.module_paths '**.layers.*.mlp' \
+      --train.accelerator.offload_config.enable_activation true \
+      --train.accelerator.offload_config.activation_gpu_limit 40 \
+      --train.accelerator.offload_config.selection.module_paths \
+        '**.layers.*.input_layernorm' \
+        '**.layers.*.post_attention_layernorm' \
+      --train.accelerator.offload_config.prefetch false
+    ;;
   all)
     run_case upper 0 \
       --train.gradient_checkpointing.enable false \
@@ -113,7 +152,7 @@ case "${MODE}" in
       --train.accelerator.offload_config.prefetch false
     ;;
   *)
-    echo "Usage: $0 [all|upper|gc|selective]" >&2
+    echo "Usage: $0 [all|upper|gc|selective|selective-gc|hybrid|hybrid-all]" >&2
     exit 2
     ;;
 esac

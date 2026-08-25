@@ -212,6 +212,9 @@ def _find_submodule(module: "nn.Module", name: str) -> Tuple["nn.Module", str]:
 
         module = getattr(module, piece)
 
+    while getattr(module, "_veomni_selective_checkpoint_wrapper", False):
+        module = module._checkpoint_wrapped_module
+
     return module, pieces[-1]
 
 

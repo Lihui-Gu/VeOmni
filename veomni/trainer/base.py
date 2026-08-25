@@ -59,6 +59,7 @@ from ..data.data_transform import build_data_transform
 from ..distributed.activation_offload import build_activation_offload_runtime
 from ..distributed.chunk_mbs import build_chunk_mbs_ranges, chunk_mbs_context
 from ..distributed.clip_grad_norm import veomni_clip_grad_norm
+from ..distributed.module_selection import resolve_activation_memory_plan
 from ..distributed.parallel_state import clear_parallel_state, init_parallel_state, use_parallel_state
 from ..distributed.torch_compile import CompileConfig, mark_compile_step_begin
 from ..distributed.torch_parallelize import build_parallelize_model
@@ -542,6 +543,11 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_parallelized_model(self):
         args: VeOmniArguments = self.args
+        self.activation_memory_plan = resolve_activation_memory_plan(
+            self.model,
+            args.train.gradient_checkpointing,
+            args.train.accelerator.offload_config,
+        )
         kwargs = {}
         cpu_load_param_name = None
         if hasattr(self.model, "get_parallel_plan"):
@@ -581,6 +587,11 @@ class BaseTrainer(Stateful, ABC):
             enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
             mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
             enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
+            selective_checkpoint_targets=(
+                self.activation_memory_plan.gradient_checkpoint_targets
+                if self.activation_memory_plan.selective_gradient_checkpointing
+                else None
+            ),
             basic_modules=list(
                 set(getattr(self.model, "_no_split_modules", None) or []) | set(args.model.basic_modules)
             ),
@@ -633,7 +644,13 @@ class BaseTrainer(Stateful, ABC):
             model=self.model,
             offload_config=self.args.train.accelerator.offload_config,
             enable_gradient_checkpointing=self.args.train.gradient_checkpointing.enable,
+            enable_selective_gradient_checkpointing=self.activation_memory_plan.selective_gradient_checkpointing,
             enable_compile=self.args.train.torch_compile.enable,
+            resolved_selection=(
+                self.activation_memory_plan.activation_offload_targets
+                if self.activation_memory_plan.selective_activation_offload
+                else None
+            ),
         )
         self.model_fwd_context = self.activation_offload_runtime.forward_context
         self.model_bwd_context = self.activation_offload_runtime.backward_context

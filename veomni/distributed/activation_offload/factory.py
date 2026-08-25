@@ -18,6 +18,7 @@ from typing import Any, Optional
 
 import torch.nn as nn
 
+from ..module_selection import ResolvedModuleSelection
 from .runtime import (
     BaseActivationOffloadRuntime,
     NullActivationOffloadRuntime,
@@ -30,7 +31,9 @@ def build_activation_offload_runtime(
     model: Optional[nn.Module],
     offload_config: Any,
     enable_gradient_checkpointing: bool = False,
+    enable_selective_gradient_checkpointing: bool = False,
     enable_compile: bool = False,
+    resolved_selection: Optional[tuple[ResolvedModuleSelection, ...]] = None,
 ) -> BaseActivationOffloadRuntime:
     """Build an activation offload runtime matching the training configuration.
 
@@ -38,9 +41,9 @@ def build_activation_offload_runtime(
         model: The parallelized model. Required when ``offload_config.selection``
             is configured.
         offload_config: Parsed ``train.accelerator.offload_config``.
-        enable_gradient_checkpointing: Whether gradient checkpointing is enabled.
-            When true and a selection is configured, the legacy threshold path is
-            used instead.
+        enable_gradient_checkpointing: Whether any gradient checkpointing is enabled.
+        enable_selective_gradient_checkpointing: Whether checkpointing targets
+            were explicitly resolved. Selective offload may coexist with this mode.
         enable_compile: Whether ``torch.compile`` is enabled. Incompatible with
             selective offload.
 
@@ -60,7 +63,7 @@ def build_activation_offload_runtime(
     # Selection is configured. Validation (GC fallback / compile rejection)
     # has already been performed by VeOmniArguments, but we keep defensive checks
     # here because the factory may be called independently of args parsing.
-    if enable_gradient_checkpointing:
+    if enable_gradient_checkpointing and not enable_selective_gradient_checkpointing:
         return ThresholdActivationOffloadRuntime(
             activation_gpu_limit=offload_config.activation_gpu_limit,
             enable_gradient_checkpointing=True,
@@ -78,4 +81,5 @@ def build_activation_offload_runtime(
     return SelectiveAsyncActivationOffloadRuntime(
         model=model,
         offload_config=offload_config,
+        resolved_selection=resolved_selection,
     )

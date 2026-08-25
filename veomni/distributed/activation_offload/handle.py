@@ -15,6 +15,7 @@
 """Activation offload handle with a state machine and async support."""
 
 import threading
+import weakref
 from enum import Enum
 from typing import Optional
 
@@ -56,7 +57,8 @@ class ActivationOffloadHandle:
         self.layout = tensor.layout
 
         self.cpu_tensor: Optional[torch.Tensor] = None
-        self.restored_tensor: Optional[torch.Tensor] = None
+        self._restored_tensor: Optional[torch.Tensor] = None
+        self._restored_tensor_ref: Optional[weakref.ReferenceType[torch.Tensor]] = None
 
         self._offload_stream = offload_stream
         self._prefetch_stream = prefetch_stream
@@ -65,6 +67,15 @@ class ActivationOffloadHandle:
         self._h2d_event: Optional[torch.Event] = None
 
         self._lock = threading.Lock()
+
+    @property
+    def restored_tensor(self) -> Optional[torch.Tensor]:
+        """Return the live device copy without extending its lifetime."""
+        if self._restored_tensor is not None:
+            return self._restored_tensor
+        if self._restored_tensor_ref is not None:
+            return self._restored_tensor_ref()
+        return None
 
     def offload(self, tensor: torch.Tensor) -> None:
         """Copy ``tensor`` to CPU and mark the handle host-ready."""
@@ -111,23 +122,31 @@ class ActivationOffloadHandle:
         """
         with self._lock:
             if self.state == HandleState.DEVICE_READY:
-                assert self.restored_tensor is not None
-                return self.restored_tensor
+                restored_tensor = self.restored_tensor
+                if restored_tensor is not None:
+                    return restored_tensor
+                # Autograd released the previous unpack result. Retained
+                # graphs may request the tensor again, so rebuild it from the
+                # durable CPU copy instead of keeping every restored device
+                # allocation alive until Python cyclic GC runs.
+                self.state = HandleState.HOST_READY
+                self._h2d_event = None
 
             if self.state == HandleState.PREFETCH_QUEUED:
                 if block:
                     self._wait_h2d_and_mark_ready()
-                assert self.restored_tensor is not None
-                return self.restored_tensor
+                assert self._restored_tensor is not None
+                return self._restored_tensor
 
             if self.state == HandleState.OFFLOAD_QUEUED:
                 self._wait_d2h()
                 self.state = HandleState.HOST_READY
 
             if self.state == HandleState.HOST_READY:
+                self._restored_tensor_ref = None
                 if self._prefetch_stream is None or self.device.type == "cpu":
                     # Synchronous H2D.
-                    self.restored_tensor = self.cpu_tensor.to(self.device, non_blocking=False)
+                    self._restored_tensor = self.cpu_tensor.to(self.device, non_blocking=False)
                     self.state = HandleState.DEVICE_READY
                 else:
                     # Allocate and copy on the same stream. In particular,
@@ -136,7 +155,7 @@ class ActivationOffloadHandle:
                     if self._d2h_event is not None:
                         self._prefetch_stream.wait_event(self._d2h_event)
                     with self._prefetch_stream:
-                        self.restored_tensor = self.cpu_tensor.to(self.device, non_blocking=True)
+                        self._restored_tensor = self.cpu_tensor.to(self.device, non_blocking=True)
                         self._h2d_event = _new_event(self.device)
                         self._h2d_event.record(self._prefetch_stream)
                     self.state = HandleState.PREFETCH_QUEUED
@@ -144,8 +163,26 @@ class ActivationOffloadHandle:
             if self.state == HandleState.PREFETCH_QUEUED and block:
                 self._wait_h2d_and_mark_ready()
 
-            assert self.restored_tensor is not None
-            return self.restored_tensor
+            assert self._restored_tensor is not None
+            return self._restored_tensor
+
+    def release_restored_tensor(self, tensor: Optional[torch.Tensor] = None) -> None:
+        """Let autograd own the consumed device copy while retaining reuse.
+
+        The strong reference is needed between asynchronous prefetch and the
+        first unpack. After unpack, a weak reference preserves idempotent reuse
+        while the consumer is alive without extending the allocation lifetime.
+        The CPU copy remains available for a later retained-graph backward.
+        """
+        if self.device.type == "cpu":
+            return
+        with self._lock:
+            if self.state == HandleState.PREFETCH_QUEUED:
+                self._wait_h2d_and_mark_ready()
+            if self._restored_tensor is None or (tensor is not None and self._restored_tensor is not tensor):
+                return
+            self._restored_tensor_ref = weakref.ref(self._restored_tensor)
+            self._restored_tensor = None
 
     def _wait_d2h(self) -> None:
         """Block until the asynchronous D2H copy has finished."""
@@ -164,10 +201,10 @@ class ActivationOffloadHandle:
                 self._h2d_event.synchronize()
             elif current_stream is not None:
                 current_stream.wait_event(self._h2d_event)
-        if self.restored_tensor is not None:
+        if self._restored_tensor is not None:
             # record_stream tells the allocator that the tensor may still be
             # used by work on the current stream.
             current_stream = _current_stream(self.device)
             if current_stream is not None:
-                self.restored_tensor.record_stream(current_stream)
+                self._restored_tensor.record_stream(current_stream)
         self.state = HandleState.DEVICE_READY

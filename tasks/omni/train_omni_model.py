@@ -19,8 +19,9 @@ from veomni.data import (
     build_multimodal_chat_template,
 )
 from veomni.data.multimodal.multimodal_transform import encode_multimodal_sample
+from veomni.distributed.activation_offload import build_activation_offload_runtime
 from veomni.distributed.clip_grad_norm import veomni_clip_grad_norm
-from veomni.distributed.offloading import build_activation_offloading_context
+from veomni.distributed.module_selection import resolve_activation_memory_plan
 from veomni.distributed.parallel_state import get_parallel_state, init_parallel_state
 from veomni.distributed.torch_parallelize import build_parallelize_model
 from veomni.models import save_model_assets, save_model_weights
@@ -261,15 +262,27 @@ def main():
             f"will skip HF weight load from {args.model.model_path}."
         )
 
+    activation_memory_plan = resolve_activation_memory_plan(
+        model,
+        args.train.gradient_checkpointing,
+        args.train.accelerator.offload_config,
+    )
+
     model = build_parallelize_model(
         model,
         weights_path=args.model.model_path,
         enable_reshard_after_forward=args.train.accelerator.fsdp_config.reshard_after_forward,
         mixed_precision=args.train.accelerator.fsdp_config.mixed_precision,
         enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
+        selective_checkpoint_targets=(
+            activation_memory_plan.gradient_checkpoint_targets
+            if activation_memory_plan.selective_gradient_checkpointing
+            else None
+        ),
         init_device=args.train.init_device,
         basic_modules=model._no_split_modules,
         enable_reentrant=args.train.gradient_checkpointing.enable_reentrant,
+        early_stop=args.train.gradient_checkpointing.early_stop,
         enable_forward_prefetch=args.train.accelerator.fsdp_config.forward_prefetch,
         enable_fsdp_offload=args.train.accelerator.fsdp_config.offload,
         broadcast_model_weights_from_rank0=args.train.broadcast_model_weights_from_rank0,
@@ -351,11 +364,20 @@ def main():
         logger.info_rank0(f"Load distributed checkpoint from {args.train.checkpoint.load_path} successfully!")
 
     helper.empty_cache()
-    model_fwd_context, model_bwd_context = build_activation_offloading_context(
-        args.train.accelerator.offload_config.enable_activation,
-        args.train.gradient_checkpointing.enable,
-        args.train.accelerator.offload_config.activation_gpu_limit,
+    activation_offload_runtime = build_activation_offload_runtime(
+        model=model,
+        offload_config=args.train.accelerator.offload_config,
+        enable_gradient_checkpointing=args.train.gradient_checkpointing.enable,
+        enable_selective_gradient_checkpointing=activation_memory_plan.selective_gradient_checkpointing,
+        enable_compile=args.train.torch_compile.enable,
+        resolved_selection=(
+            activation_memory_plan.activation_offload_targets
+            if activation_memory_plan.selective_activation_offload
+            else None
+        ),
     )
+    model_fwd_context = activation_offload_runtime.forward_context
+    model_bwd_context = activation_offload_runtime.backward_context
     model.train()
     logger.info(
         f"rank{args.train.local_rank} Start training, train_steps: {args.train.train_steps}, epochs: {args.train.num_train_epochs}"
@@ -521,6 +543,8 @@ def main():
             fqn_to_index_mapping=args.model.fqn_to_index_mapping,
         )
 
+    activation_offload_runtime.log_summary()
+    activation_offload_runtime.close()
     dist.barrier()
     dist.destroy_process_group()
 

@@ -47,6 +47,7 @@ class _SelectiveBackwardContext:
         self._hooks: Optional[saved_tensors_hooks] = None
 
     def __enter__(self) -> "_SelectiveBackwardContext":
+        self.runtime.start_backward()
         self._hooks = saved_tensors_hooks(self.runtime.pack_hook, self.runtime.unpack_hook)
         self._hooks.__enter__()
         return self

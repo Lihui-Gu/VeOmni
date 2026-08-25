@@ -15,7 +15,6 @@
 """Selective asynchronous activation offload runtime."""
 
 import weakref
-from collections.abc import Mapping
 from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -23,13 +22,13 @@ import torch
 from torch import nn
 from torch.autograd.graph import saved_tensors_hooks
 
+from ..module_selection import ResolvedModuleSelection, resolve_module_selection
 from ..offloading import (
     OffloadPolicy,
     PackedThresholdActivation,
     _ActivationOffloadThresholdPolicy,
     build_activation_offloading_context,
 )
-from .config import ResolvedModuleSelection, resolve_module_class_selection
 from .handle import ActivationOffloadHandle
 from .stats import ActivationOffloadStats
 from .utils import _StreamCache
@@ -102,6 +101,7 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         self,
         model: nn.Module,
         offload_config: Any,
+        resolved_selection: Optional[Tuple[ResolvedModuleSelection, ...]] = None,
     ) -> None:
         self.config = offload_config
         self.prefetch = bool(offload_config.prefetch)
@@ -113,17 +113,33 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         self._call_counter = 0
         self._call_stack: List[int] = []
         self._forward_order: List[int] = []
+        self._backward_started_call_ids: set[int] = set()
         self._handles_by_call_id: Dict[int, List[ActivationOffloadHandle]] = {}
+        self._live_handles: weakref.WeakSet[ActivationOffloadHandle] = weakref.WeakSet()
         self._module_hooks: List[Tuple[nn.Module, Any, Any]] = []
         self._stream_cache = _StreamCache()
         self._current_pinned_bytes = 0
 
-        selections = resolve_module_class_selection(
-            model,
-            offload_config.selection.module_classes,
-        )
+        selections = resolved_selection
+        if selections is None:
+            selections = resolve_module_selection(model, offload_config.selection)
+        if self.prefetch:
+            self._validate_prefetch_selection(selections)
         self._install_module_hooks(selections)
         self.stats.num_matched_module_calls = len(selections)
+
+    @staticmethod
+    def _validate_prefetch_selection(selections: Tuple[ResolvedModuleSelection, ...]) -> None:
+        paths = [path for selection in selections for path in (selection.module_path, *selection.alias_paths)]
+        for index, path in enumerate(paths):
+            for other_path in paths[index + 1 :]:
+                path_is_ancestor = (not path and bool(other_path)) or other_path.startswith(path + ".")
+                other_is_ancestor = (not other_path and bool(path)) or path.startswith(other_path + ".")
+                if path_is_ancestor or other_is_ancestor:
+                    raise ValueError(
+                        "Selective activation prefetch does not support nested module selections: "
+                        f"{path!r} and {other_path!r}. Disable prefetch or select non-overlapping modules."
+                    )
 
     # ------------------------------------------------------------------
     # Module hooks
@@ -149,56 +165,7 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         def hook(module, inputs, outputs):
             if not self._call_stack:
                 return
-            call_id = self._call_stack.pop()
-            if not self.prefetch:
-                return
-            output_tensors = self._get_grad_requiring_outputs(outputs)
-            if output_tensors:
-                backward_hook = self._make_output_grad_hook(call_id)
-                for output_tensor in output_tensors:
-                    output_tensor.register_hook(backward_hook)
-
-        return hook
-
-    @staticmethod
-    def _get_grad_requiring_outputs(outputs: Any) -> Tuple[torch.Tensor, ...]:
-        tensors: List[torch.Tensor] = []
-        seen_tensor_ids = set()
-
-        def collect(value: Any) -> None:
-            if isinstance(value, torch.Tensor):
-                if value.requires_grad and id(value) not in seen_tensor_ids:
-                    seen_tensor_ids.add(id(value))
-                    tensors.append(value)
-            elif isinstance(value, Mapping):
-                for item in value.values():
-                    collect(item)
-            elif isinstance(value, (tuple, list)):
-                for item in value:
-                    collect(item)
-
-        collect(outputs)
-        return tuple(tensors)
-
-    def _make_output_grad_hook(self, call_id: int):
-        triggered = False
-
-        def hook(grad):
-            nonlocal triggered
-            if triggered:
-                return
-            triggered = True
-            # Once this module's backward starts, the scheduler no longer
-            # needs to own its handles. Autograd keeps them alive for any
-            # remaining or repeated unpack calls.
-            self._handles_by_call_id.pop(call_id, None)
-            try:
-                idx = self._forward_order.index(call_id)
-            except ValueError:
-                return
-            if idx > 0:
-                prev_call_id = self._forward_order[idx - 1]
-                self._prefetch_call(prev_call_id)
+            self._call_stack.pop()
 
         return hook
 
@@ -254,6 +221,7 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         handle.offload(tensor)
         if self.prefetch:
             self._handles_by_call_id.setdefault(call_id, []).append(handle)
+            self._live_handles.add(handle)
         self.stats.num_offloaded_tensors += 1
         self.stats.offloaded_bytes += tensor.numel() * tensor.element_size()
         if handle.cpu_tensor is not None:
@@ -269,8 +237,29 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
     def _restore_selected(self, handle: ActivationOffloadHandle) -> torch.Tensor:
         self.stats.num_ondemand_restores += 1
         tensor = handle.ensure_device_resident(block=True)
+        if self.prefetch:
+            self._begin_backward_call(handle.call_id)
         self.stats.restored_bytes += tensor.numel() * tensor.element_size()
+        handle.release_restored_tensor(tensor)
         return tensor
+
+    def start_backward(self) -> None:
+        """Submit the final forward call before autograd starts consuming it."""
+        if self.prefetch and self._forward_order:
+            self._prefetch_call(self._forward_order[-1])
+
+    def _begin_backward_call(self, call_id: int) -> None:
+        """Prefetch the preceding forward call at the first current unpack."""
+        if call_id in self._backward_started_call_ids:
+            return
+        self._backward_started_call_ids.add(call_id)
+        self._handles_by_call_id.pop(call_id, None)
+        try:
+            idx = self._forward_order.index(call_id)
+        except ValueError:
+            return
+        if idx > 0:
+            self._prefetch_call(self._forward_order[idx - 1])
 
     def _prefetch_call(self, call_id: int) -> None:
         """Prefetch all activations belonging to ``call_id`` to the device.
@@ -284,10 +273,14 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
             self.stats.num_prefetch_hits += 1
 
     def finish_backward(self) -> None:
-        """Release per-step indexes while keeping call IDs generation-safe."""
+        """Release per-step device copies and indexes."""
+        for handle in tuple(self._live_handles):
+            handle.release_restored_tensor()
         self._call_stack.clear()
         self._forward_order.clear()
+        self._backward_started_call_ids.clear()
         self._handles_by_call_id.clear()
+        self._live_handles.clear()
 
     # ------------------------------------------------------------------
     # Runtime interface

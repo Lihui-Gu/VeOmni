@@ -139,11 +139,21 @@ VeOmni uses FSDP2 exclusively.
 2. Model-specific `parallel_plan.py` -> define EP/embedding weight sharding via `ParallelPlan`
 3. `build_parallelize_model()` -> `parallelize_model_fsdp2()`:
    - `ParallelPlan.apply()` wraps EP/embedding params as DTensors on para mesh
+   - Optional selective non-reentrant checkpoint wrappers are installed from module identities resolved before parallelization
    - `fully_shard()` on EP modules with `ep_fsdp` submesh (Shard(1) for hidden dim)
    - `fully_shard()` on each transformer block with `fsdp_mesh`
    - `fully_shard()` on root model
 4. SP is orthogonal to FSDP2 — models call Ulysses all-to-all (`gather_seq_scatter_heads` / `gather_heads_scatter_seq`) around attention; the FSDP shard mesh fuses with SP mesh (`dp_shard_sp`)
 5. EP token routing is in model MoE code + `moe_layer.py` using `ep_group` from `ParallelState`
+
+## Activation Memory Flow
+
+`resolve_activation_memory_plan()` resolves shared class/path selectors before TP, ExtraParallel, checkpoint wrappers,
+or FSDP2 alter the visible module tree. Selective gradient-checkpoint targets are wrapped after `ParallelPlan.apply()`
+and before `fully_shard()`; the transparent wrapper preserves state-dict and named-parameter keys. After
+parallelization, `SelectiveAsyncActivationOffloadRuntime` installs hooks directly on the previously resolved offload
+module identities. Non-reentrant checkpoint hooks own tensors inside GC regions, while the outer offload runtime owns
+selected sibling regions and applies the legacy threshold policy elsewhere.
 
 ## Config Structure
 
