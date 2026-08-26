@@ -477,14 +477,18 @@ validation instead of applying ChunkMBS to multiple stacks.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | enable_activation | `bool` | `False` | Enable activation offload to CPU. |
-| activation_gpu_limit | `float` | `0.0` | GB of activations allowed to remain on GPU. |
+| activation_gpu_limit | `float` | `0.0` | Soft GiB budget for eligible activations allowed to remain on the accelerator. Selected activations participate in this budget. |
 | selection | `Optional[ModuleSelectionConfig]` | `None` | Optional module class/path selection for asynchronous activation offload. |
 | prefetch | `bool` | `False` | Prefetch the next selected module's activations during backward. |
+| exclude_parameter_views | `bool` | `False` | Keep parameter tensors and storage-sharing parameter views on the accelerator inside selected modules. |
 
-Without `selection`, `enable_activation: true` retains the existing threshold-based behavior. When model-wide
-gradient checkpointing is enabled, module selection and prefetch are ignored with a warning and the threshold path
-remains active. When both GC and offload provide explicit, non-overlapping selections, VeOmni enables hybrid
-selective recomputation and asynchronous offload. Selective activation offload is not supported with `torch.compile`.
+Without `selection`, `enable_activation: true` retains the existing threshold-based behavior. With model-wide
+gradient checkpointing and an offload selection, VeOmni derives a checkpoint replacement plan: selected direct
+children of `GradientCheckpointingLayer` boundaries use asynchronous offload, unaffected boundaries remain fully
+checkpointed, and unselected siblings in affected boundaries receive transparent checkpoint wrappers. Unsupported
+or deeper selections fail before training instead of falling back silently. An explicit
+`gradient_checkpointing.selection` remains available for compatibility and advanced layouts. Selective activation
+offload is not supported with `torch.compile`.
 
 ### ModuleSelectionConfig
 
@@ -510,6 +514,7 @@ train:
         module_classes:
           - Qwen3_5GatedDeltaNet
       prefetch: true
+      exclude_parameter_views: true
 ```
 
 See `configs/multimodal/qwen3_5/qwen3_5_vl_ascendc_hybrid_activation.yaml` for a hybrid selective-GC and offload example.

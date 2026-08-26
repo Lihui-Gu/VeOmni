@@ -148,12 +148,16 @@ VeOmni uses FSDP2 exclusively.
 
 ## Activation Memory Flow
 
-`resolve_activation_memory_plan()` resolves shared class/path selectors before TP, ExtraParallel, checkpoint wrappers,
-or FSDP2 alter the visible module tree. Selective gradient-checkpoint targets are wrapped after `ParallelPlan.apply()`
-and before `fully_shard()`; the transparent wrapper preserves state-dict and named-parameter keys. After
-parallelization, `SelectiveAsyncActivationOffloadRuntime` installs hooks directly on the previously resolved offload
-module identities. Non-reentrant checkpoint hooks own tensors inside GC regions, while the outer offload runtime owns
-selected sibling regions and applies the legacy threshold policy elsewhere.
+`resolve_activation_memory_plan()` resolves class/path selectors before TP, ExtraParallel, checkpoint wrappers, or
+FSDP2 alter the visible module tree. With model-wide GC plus an offload selection, it automatically derives a
+checkpoint replacement plan from `GradientCheckpointingLayer` boundaries: unaffected boundaries remain whole-module
+checkpoint targets, while an affected boundary is split into direct computation children and selected children remain
+unwrapped for offload. Deeper selections fail before training instead of using a raw module-tree complement. Explicit
+selective-GC targets remain supported for compatibility. Checkpoint targets are wrapped after `ParallelPlan.apply()`
+and before `fully_shard()`; transparent wrappers preserve state-dict and named-parameter keys. After parallelization,
+`SelectiveAsyncActivationOffloadRuntime` installs hooks on the resolved offload identities. Its residency budget now
+includes selected activations; selected tensors over budget use asynchronous offload, while checkpoint hooks own
+tensors inside recomputed regions.
 
 ## Config Structure
 

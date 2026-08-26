@@ -15,12 +15,14 @@
 """Selective asynchronous activation offload runtime."""
 
 import weakref
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
 from torch.autograd.graph import saved_tensors_hooks
+from torch.utils.checkpoint import noop_context_fn
 
 from ..module_selection import ResolvedModuleSelection, resolve_module_selection
 from ..offloading import (
@@ -32,6 +34,14 @@ from ..offloading import (
 from .handle import ActivationOffloadHandle
 from .stats import ActivationOffloadStats
 from .utils import _StreamCache
+
+
+@dataclass
+class _PackedResidentActivation:
+    """An activation retained under the accelerator-residency budget."""
+
+    tensor: torch.Tensor
+    budget_finalizer: Any = field(default=None, repr=False)
 
 
 class BaseActivationOffloadRuntime:
@@ -90,11 +100,12 @@ class ThresholdActivationOffloadRuntime(BaseActivationOffloadRuntime):
 
 
 class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
-    """Module-class-selective activation offload runtime.
+    """Module-selective activation offload runtime.
 
-    Selected saved tensors are copied asynchronously to CPU on a dedicated
-    offload stream and restored on a dedicated prefetch stream. Non-selected
-    tensors fall back to the legacy threshold policy.
+    Selected saved tensors participate in the accelerator-residency budget.
+    Tensors over budget are copied asynchronously to CPU on a dedicated offload
+    stream and restored on a dedicated prefetch stream. Non-selected tensors
+    fall back to the legacy threshold execution path.
     """
 
     def __init__(
@@ -102,9 +113,12 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         model: nn.Module,
         offload_config: Any,
         resolved_selection: Optional[Tuple[ResolvedModuleSelection, ...]] = None,
+        use_checkpoint_recompute_prefetch: bool = False,
     ) -> None:
         self.config = offload_config
         self.prefetch = bool(offload_config.prefetch)
+        self.use_checkpoint_recompute_prefetch = use_checkpoint_recompute_prefetch
+        self.exclude_parameter_views = bool(getattr(offload_config, "exclude_parameter_views", False))
         self.threshold_policy = _ActivationOffloadThresholdPolicy(
             gpu_limit_in_gb=offload_config.activation_gpu_limit,
         )
@@ -115,6 +129,12 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         self._forward_order: List[int] = []
         self._backward_started_call_ids: set[int] = set()
         self._handles_by_call_id: Dict[int, List[ActivationOffloadHandle]] = {}
+        self._checkpoint_group_cursor = 0
+        self._checkpoint_prefetch_groups: List[Tuple[int, ...]] = []
+        self._active_checkpoint_prefetch_call_ids: set[int] = set()
+        self._active_checkpoint_prefetch_group_started = False
+        self._checkpoint_wrappers: List[nn.Module] = []
+        self._parameter_storage_keys_by_call_id: Dict[int, set[tuple[str, Optional[int], int]]] = {}
         self._live_handles: weakref.WeakSet[ActivationOffloadHandle] = weakref.WeakSet()
         self._module_hooks: List[Tuple[nn.Module, Any, Any]] = []
         self._stream_cache = _StreamCache()
@@ -126,6 +146,8 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         if self.prefetch:
             self._validate_prefetch_selection(selections)
         self._install_module_hooks(selections)
+        if self.prefetch and self.use_checkpoint_recompute_prefetch:
+            self._install_checkpoint_contexts(model)
         self.stats.num_matched_module_calls = len(selections)
 
     @staticmethod
@@ -148,16 +170,36 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         """Attach forward pre/post hooks to every selected module instance."""
         for selection in selections:
             module = selection.module
-            pre_handle = module.register_forward_pre_hook(self._make_forward_pre_hook())
+            pre_handle = module.register_forward_pre_hook(self._make_forward_pre_hook(module))
             post_handle = module.register_forward_hook(self._make_forward_post_hook())
             self._module_hooks.append((module, pre_handle, post_handle))
 
-    def _make_forward_pre_hook(self):
+    def _install_checkpoint_contexts(self, model: nn.Module) -> None:
+        checkpoint_plan_owner = model
+        if not hasattr(checkpoint_plan_owner, "_veomni_selective_checkpoint_wrappers"):
+            wrapped_model = getattr(model, "module", None)
+            if isinstance(wrapped_model, nn.Module):
+                checkpoint_plan_owner = wrapped_model
+        wrappers = tuple(getattr(checkpoint_plan_owner, "_veomni_selective_checkpoint_wrappers", ()))
+        if not wrappers:
+            self.use_checkpoint_recompute_prefetch = False
+            return
+        for wrapper in wrappers:
+            wrapper.set_checkpoint_context_fn(self.checkpoint_contexts)
+        self._checkpoint_wrappers.extend(wrappers)
+
+    def _make_forward_pre_hook(self, selected_module: nn.Module):
         def hook(module, inputs):
             self._call_counter += 1
             call_id = self._call_counter
             self._call_stack.append(call_id)
             self._forward_order.append(call_id)
+            if self.exclude_parameter_views:
+                self._parameter_storage_keys_by_call_id[call_id] = {
+                    storage_key
+                    for parameter in selected_module.parameters()
+                    if (storage_key := self._storage_key(parameter)) is not None
+                }
 
         return hook
 
@@ -165,22 +207,38 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         def hook(module, inputs, outputs):
             if not self._call_stack:
                 return
-            self._call_stack.pop()
+            call_id = self._call_stack.pop()
+            self._parameter_storage_keys_by_call_id.pop(call_id, None)
 
         return hook
 
     # ------------------------------------------------------------------
     # Saved-tensor hooks
     # ------------------------------------------------------------------
-    def pack_hook(self, tensor: torch.Tensor) -> Union[ActivationOffloadHandle, PackedThresholdActivation]:
+    def pack_hook(
+        self, tensor: torch.Tensor
+    ) -> Union[ActivationOffloadHandle, PackedThresholdActivation, _PackedResidentActivation]:
         """Pack a saved tensor for activation offload.
 
-        Selected modules are always offloaded; non-selected tensors fall back
-        to the legacy threshold policy.
+        Eligible tensors share one accelerator-residency budget. Selected
+        tensors over budget use asynchronous offload; non-selected tensors over
+        budget use the legacy synchronous fallback.
         """
         call_id = self._current_module_call_id()
         if call_id is not None:
-            return self._offload_selected(tensor, call_id)
+            if self.exclude_parameter_views and self._is_parameter_view(tensor, call_id):
+                tensor_num_bytes = tensor.numel() * tensor.element_size()
+                self.stats.num_parameter_views_skipped += 1
+                self.stats.parameter_view_bytes_skipped += tensor_num_bytes
+                return (OffloadPolicy.IGNORE, tensor.device, tensor)
+            policy = self.threshold_policy.decide(tensor, min_offload_size=0)
+            if policy == OffloadPolicy.OFFLOAD:
+                return self._offload_selected(tensor, call_id)
+            if policy == OffloadPolicy.KEEP_ON_GPU:
+                self.stats.num_threshold_keep_on_gpu += 1
+                return self._pack_resident(tensor, policy)
+            self.stats.num_ignored_tensors += 1
+            return (policy, tensor.device, tensor)
 
         policy = self.threshold_policy.decide(tensor)
         if policy == OffloadPolicy.OFFLOAD:
@@ -188,14 +246,18 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
             return (policy, tensor.device, tensor.cpu())
         if policy == OffloadPolicy.KEEP_ON_GPU:
             self.stats.num_threshold_keep_on_gpu += 1
-            return (policy, tensor.device, tensor)
+            return self._pack_resident(tensor, policy)
         self.stats.num_ignored_tensors += 1
         return (policy, tensor.device, tensor)
 
-    def unpack_hook(self, packed: Union[ActivationOffloadHandle, PackedThresholdActivation]) -> torch.Tensor:
+    def unpack_hook(
+        self, packed: Union[ActivationOffloadHandle, PackedThresholdActivation, _PackedResidentActivation]
+    ) -> torch.Tensor:
         """Restore a tensor that was packed by :meth:`pack_hook`."""
         if isinstance(packed, ActivationOffloadHandle):
             return self._restore_selected(packed)
+        if isinstance(packed, _PackedResidentActivation):
+            return packed.tensor
 
         policy, device, tensor = packed
         self.threshold_policy.release(policy, tensor)
@@ -210,6 +272,32 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         if self._call_stack:
             return self._call_stack[-1]
         return None
+
+    @staticmethod
+    def _storage_key(tensor: torch.Tensor) -> Optional[tuple[str, Optional[int], int]]:
+        """Identify a tensor's underlying allocation without retaining it."""
+        local_tensor = tensor.to_local() if hasattr(tensor, "to_local") else tensor
+        try:
+            data_ptr = local_tensor.untyped_storage().data_ptr()
+        except RuntimeError:
+            return None
+        return (local_tensor.device.type, local_tensor.device.index, data_ptr)
+
+    def _is_parameter_view(self, tensor: torch.Tensor, call_id: int) -> bool:
+        storage_key = self._storage_key(tensor)
+        return storage_key is not None and storage_key in self._parameter_storage_keys_by_call_id.get(call_id, ())
+
+    def _pack_resident(self, tensor: torch.Tensor, policy: OffloadPolicy) -> _PackedResidentActivation:
+        if policy != OffloadPolicy.KEEP_ON_GPU:
+            raise ValueError(f"Cannot track a non-resident activation with policy {policy}.")
+        packed = _PackedResidentActivation(tensor)
+        tensor_num_bytes = tensor.numel() * tensor.element_size()
+        packed.budget_finalizer = weakref.finalize(
+            packed,
+            self.threshold_policy.release_bytes,
+            tensor_num_bytes,
+        )
+        return packed
 
     def _offload_selected(self, tensor: torch.Tensor, call_id: int) -> ActivationOffloadHandle:
         handle = ActivationOffloadHandle(
@@ -245,7 +333,10 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
 
     def start_backward(self) -> None:
         """Submit the final forward call before autograd starts consuming it."""
-        if self.prefetch and self._forward_order:
+        if self.prefetch and self.use_checkpoint_recompute_prefetch:
+            if self._seal_checkpoint_prefetch_group():
+                self._prefetch_next_checkpoint_group()
+        elif self.prefetch and self._forward_order:
             self._prefetch_call(self._forward_order[-1])
 
     def _begin_backward_call(self, call_id: int) -> None:
@@ -254,6 +345,11 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
             return
         self._backward_started_call_ids.add(call_id)
         self._handles_by_call_id.pop(call_id, None)
+        if self.use_checkpoint_recompute_prefetch:
+            if call_id in self._active_checkpoint_prefetch_call_ids:
+                self._active_checkpoint_prefetch_call_ids.discard(call_id)
+                self._active_checkpoint_prefetch_group_started = True
+            return
         try:
             idx = self._forward_order.index(call_id)
         except ValueError:
@@ -272,6 +368,41 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
             handle.ensure_device_resident(block=False)
             self.stats.num_prefetch_hits += 1
 
+    def checkpoint_contexts(self) -> tuple[AbstractContextManager, AbstractContextManager]:
+        """Seal the preceding offload group and prefetch it during recomputation."""
+        self._seal_checkpoint_prefetch_group()
+        return nullcontext(), _CheckpointRecomputePrefetchContext(self)
+
+    def _seal_checkpoint_prefetch_group(self) -> bool:
+        call_ids = tuple(
+            call_id
+            for call_id in self._forward_order[self._checkpoint_group_cursor :]
+            if call_id in self._handles_by_call_id
+        )
+        self._checkpoint_group_cursor = len(self._forward_order)
+        if call_ids:
+            self._checkpoint_prefetch_groups.append(call_ids)
+            return True
+        return False
+
+    def _prefetch_next_checkpoint_group(self) -> None:
+        if self._active_checkpoint_prefetch_call_ids or not self._checkpoint_prefetch_groups:
+            return
+        call_ids = self._checkpoint_prefetch_groups.pop()
+        self._active_checkpoint_prefetch_call_ids.update(call_ids)
+        self._active_checkpoint_prefetch_group_started = False
+        for call_id in call_ids:
+            self._prefetch_call(call_id)
+        self.stats.num_checkpoint_prefetch_groups += 1
+
+    def _retire_active_checkpoint_prefetch_group(self) -> None:
+        """Release prefetched calls left unused when the next GC boundary starts."""
+        for call_id in self._active_checkpoint_prefetch_call_ids:
+            for handle in self._handles_by_call_id.pop(call_id, ()):
+                handle.release_restored_tensor()
+        self._active_checkpoint_prefetch_call_ids.clear()
+        self._active_checkpoint_prefetch_group_started = False
+
     def finish_backward(self) -> None:
         """Release per-step device copies and indexes."""
         for handle in tuple(self._live_handles):
@@ -280,6 +411,11 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         self._forward_order.clear()
         self._backward_started_call_ids.clear()
         self._handles_by_call_id.clear()
+        self._checkpoint_group_cursor = 0
+        self._checkpoint_prefetch_groups.clear()
+        self._active_checkpoint_prefetch_call_ids.clear()
+        self._active_checkpoint_prefetch_group_started = False
+        self._parameter_storage_keys_by_call_id.clear()
         self._live_handles.clear()
 
     # ------------------------------------------------------------------
@@ -301,9 +437,28 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         self.stats.log()
 
     def close(self) -> None:
+        for wrapper in self._checkpoint_wrappers:
+            wrapper.set_checkpoint_context_fn(noop_context_fn)
+        self._checkpoint_wrappers.clear()
         for _module, pre_handle, post_handle in self._module_hooks:
             pre_handle.remove()
             post_handle.remove()
         self._module_hooks.clear()
         self.finish_backward()
         self._stream_cache.clear()
+
+
+class _CheckpointRecomputePrefetchContext:
+    """Trigger one pending activation group when checkpoint recomputation starts."""
+
+    def __init__(self, runtime: SelectiveAsyncActivationOffloadRuntime) -> None:
+        self.runtime = runtime
+
+    def __enter__(self) -> "_CheckpointRecomputePrefetchContext":
+        if self.runtime._active_checkpoint_prefetch_group_started:
+            self.runtime._retire_active_checkpoint_prefetch_group()
+        self.runtime._prefetch_next_checkpoint_group()
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        return None

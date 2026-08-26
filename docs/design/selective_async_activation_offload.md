@@ -6,56 +6,57 @@
 
 ## 1. Status and Scope
 
-**Status:** Stage 1 and Stage 2 selective-GC integration implemented and validated on Ascend NPU.
+**Status:** Stage 1 selective asynchronous offload and the Stage 2 checkpoint
+replacement planner are implemented. Accelerator-scale validation of the new
+Stage 2 policy remains pending.
 
-This RFC defines the **first-stage implementation** of **Selective Asynchronous Activation Offload** in VeOmni. The core objective is to support, without modifying model `forward` signatures or generated modeling files:
+Stage 1 selects module activations for asynchronous CPU offload when gradient
+checkpointing (GC) is disabled. Stage 2 defines a simpler hybrid policy:
 
-- Selecting saved tensors for offload by module class name;
-- Asynchronously copying selected saved tensors to pinned CPU memory on dedicated streams;
-- Backward prefetching the next selected module's activations in reverse forward order (prefetch depth = 1);
-- Preserving numerical equivalence and compatibility with FSDP2 and Ulysses sequence parallelism;
-- Keeping the existing `enable_activation` behavior unchanged when no module selection is configured.
+- GC enabled without an offload selection means ordinary model-wide GC;
+- GC enabled with an offload selection means that selected module regions use
+  activation offload instead of recomputation;
+- all remaining checkpointable regions continue to use GC;
+- the standard hybrid configuration requires only the offload selection;
+  explicit `gradient_checkpointing.selection` remains available for backward
+  compatibility and advanced layouts, but is not required for mode B;
+- no complement is inferred over the raw `named_modules()` tree.
 
-The proposed **second-stage hybrid mode** extends that implementation with:
+The implementation must preserve numerical equivalence and compatibility with
+FSDP2 and Ulysses sequence parallelism without modifying model `forward`
+signatures or patchgen-generated files.
 
-- Explicit, non-overlapping module selections for non-reentrant gradient checkpointing and asynchronous activation offload;
-- A shared selector schema supporting both implementation class names and logical module paths;
-- Recomputation of explicitly selected GC modules while saved tensors from explicitly selected offload modules are transferred asynchronously;
-- Backward-compatible behavior when `gradient_checkpointing.selection` is absent.
-
-**Out of scope for this stage:** operator-level selection, automatic inference of the complement of an offload selection, custom Python selectors, configurable prefetch depth, sparse/quantized/DTensor offloading, reentrant GC in hybrid mode, and integration with `torch.compile`.
-
----
-
-## 2. Motivation
-
-VeOmni currently implements activation offloading in `veomni/distributed/offloading.py` via process-level `saved_tensors_hooks`. The selection policy is limited to:
-
-- A device memory threshold controlled by `activation_gpu_limit`;
-- A heuristic to skip linear weight transposes.
-
-It lacks:
-
-- Module-level selection;
-- Dedicated D2H/H2D streams;
-- Event-based producer/consumer synchronization;
-- Backward prefetch;
-- Explicit handling of repeated `unpack_hook` calls.
-
-This proposal adds these capabilities without breaking existing configurations, and targets Qwen3.5 Dense 9B on Ascend NPU as the first validation workload.
-
-The hybrid extension targets a stricter comparison against the GC baseline. A
-selective-offload-only run may retain substantially more accelerator memory than
-a GC run, so a throughput comparison between those two modes is not necessarily
-memory-equivalent. Hybrid mode keeps recomputation for explicitly selected
-compute regions and uses offload only where transferring the required saved
-tensors is expected to cost less than recomputation.
+Out of scope: arbitrary module-tree complement inference, operator-level
+selection, custom Python selectors, configurable prefetch depth,
+sparse/quantized/DTensor offloading, reentrant GC in hybrid mode, and
+`torch.compile` integration.
 
 ---
 
-## 3. Configuration Semantics and Behavior Matrix
+## 2. User-Facing Memory Strategies
 
-### 3.1 Stage 1: selective offload
+The design exposes three primary operating points:
+
+| Mode | GC | Selective offload | Intended behavior |
+|---|---|---|---|
+| A | Disabled | Disabled | Speed upper bound. Activations remain on the accelerator and the workload may OOM. |
+| B | Enabled | Enabled with `selection` | Selected regions offload saved activations instead of recomputing; remaining regions use GC. |
+| C | Enabled | Disabled | Model-wide recomputation with the lowest expected activation-memory requirement. |
+
+Mode B is a tunable memory/compute/transfer tradeoff. With a zero accelerator
+residency budget it should target a peak close to mode C. A positive budget
+keeps part of the selected activations on the accelerator and intentionally
+moves the operating point toward mode A.
+
+“Close to mode C” is an acceptance target, not a hard invariant. Prefetched
+activations, FSDP all-gathers, allocator fragmentation, and operator workspaces
+can make the measured peak differ from the pure-GC run.
+
+---
+
+## 3. Configuration Semantics
+
+### 3.1 Hybrid configuration
 
 ```yaml
 train:
@@ -64,97 +65,69 @@ train:
       enable_activation: true
       activation_gpu_limit: 2.0
       selection:
-        module_classes:
-          - Qwen3_5GatedDeltaNet
+        module_paths:
+          - "**.layers.*.self_attn"
+          - "**.layers.*.linear_attn"
+          - "**.layers.*.mlp"
       prefetch: true
-  gradient_checkpointing:
-    enable: false
-```
+      exclude_parameter_views: true
 
-| Configuration | Actual Behavior |
-|---|---|
-| `enable_activation: false` | No activation offloading is installed. |
-| `enable_activation: true`, no `selection` | Use the existing synchronous `custom_save_on_cpu` threshold policy. |
-| `enable_activation: true`, `selection` present, `gradient_checkpointing.enable: true` | Log a warning, ignore `selection` and `prefetch`, fall back to the legacy threshold path. |
-| `enable_activation: true`, `selection` present, `gradient_checkpointing: false`, `torch.compile: true` | Raise an error — selective offload is not supported with `torch.compile`. |
-| `enable_activation: true`, `selection` present, `gradient_checkpointing: false`, `torch.compile: false` | Enable the new `SelectiveAsyncActivationOffloadRuntime`. |
-
-`prefetch` is intentionally placed **outside** `selection` because it controls transfer scheduling, not target selection.
-
-- `prefetch: false`: asynchronous D2H during forward; H2D is started on demand in `unpack_hook` when backward actually needs the tensor (correct, but may introduce waits).
-- `prefetch: true`: asynchronous D2H during forward, plus depth-1 forward-looking H2D prefetch during backward, overlapping H2D with backward compute.
-
-### 3.2 Stage 2: selective GC plus selective asynchronous offload
-
-The following is the hybrid configuration. The
-`gradient_checkpointing.selection` and `selection.module_paths` fields were
-added by Stage 2.
-
-```yaml
-train:
   gradient_checkpointing:
     enable: true
     enable_reentrant: false
     early_stop: true
-    selection:
-      module_paths:
-        - "**.layers.*.self_attn"
-        - "**.layers.*.linear_attn"
-        - "**.layers.*.mlp"
-
-  accelerator:
-    offload_config:
-      enable_activation: true
-      activation_gpu_limit: 80
-      selection:
-        module_paths:
-          - "**.layers.*.input_layernorm"
-          - "**.layers.*.post_attention_layernorm"
-      prefetch: false
 ```
 
-The two selections have different meanings and are intentionally not inferred
-from each other:
+This configuration is mode B. The offload selection is an exception to the
+default GC policy: matched attention, linear-attention, and MLP regions retain
+their computation results through activation offload, while the activation
+memory planner keeps GC on the remaining checkpoint regions.
 
-- `gradient_checkpointing.selection` identifies modules to recompute;
-- `offload_config.selection` identifies modules whose saved tensors use
-  selective asynchronous offload.
+No extra mode flag is required. The combination of
+`gradient_checkpointing.enable: true` and a non-empty
+`offload_config.selection` uniquely selects the replacement behavior.
 
-Defining GC targets as every module outside the offload selection is unsafe:
-the complement contains parents, children, containers, and overlapping
-checkpoint regions. Hybrid mode therefore requires explicit GC targets.
+### 3.2 Behavior matrix
 
 | Configuration | Target behavior |
 |---|---|
-| GC disabled, offload selection present | Preserve the Stage 1 selective-offload behavior. |
-| GC enabled, no GC selection, no offload selection | Preserve the existing model-wide GC behavior. |
-| GC enabled, no GC selection, offload selection present | Preserve the Stage 1 warning and legacy threshold fallback for backward compatibility. |
-| GC enabled, GC selection present, offload disabled | Apply non-reentrant checkpointing only to the explicit GC targets. |
-| GC enabled, GC selection present, threshold offload enabled without an offload selection | Apply selective GC plus the legacy threshold offload contexts. |
-| GC enabled, GC selection and offload selection present | Enable hybrid selective GC plus selective asynchronous offload. |
+| GC disabled, activation offload disabled | Mode A. No activation-memory transformation. |
+| GC enabled, activation offload disabled | Mode C. Preserve model-wide GC. |
+| GC disabled, offload selection present | Stage 1 selective asynchronous offload. |
+| GC enabled, offload selection present | Mode B. Replace recomputation with offload for selected regions and retain GC elsewhere. |
+| Activation offload enabled without a selection | Preserve the legacy threshold offload path. |
 | Hybrid mode with `enable_reentrant: true` | Raise a configuration error. |
-| Selective GC, selective offload, or hybrid mode with `torch.compile: true` | Raise a configuration error. |
-| Selective GC with ChunkMBS | Raise a configuration error. |
+| Selective offload or hybrid mode with `torch.compile: true` | Raise a configuration error. |
+
+The previous behavior that warned, ignored the selection, and silently fell
+back to threshold offload when model-wide GC was enabled is removed. A hybrid
+configuration must either build a valid replacement plan or fail before
+training.
+
+### 3.3 Option meanings
+
+- `selection`: modules whose saved activations replace recomputation. Class and
+  path values follow the selector rules in Section 4.
+- `activation_gpu_limit`: soft GiB budget for eligible saved activations from
+  selected modules that may remain on the accelerator. `0` requests full
+  offload of eligible selected activations; a positive value provides a memory
+  compromise. It is not a total device-memory limit.
+- `prefetch: false`: restore a selected tensor when autograd first requests it.
+- `prefetch: true`: prefetch the next bounded activation group during a GC
+  recomputation window when one is available. In Stage 1, use reverse module
+  order because there are no GC windows.
+- `exclude_parameter_views: true`: keep parameters and storage-sharing
+  parameter views on the accelerator. Activation offload should not create
+  parameter-transfer traffic.
+
+Prefetch scheduling mode is derived from whether hybrid GC is active; users do
+not need a separate `prefetch_mode` setting.
 
 ---
 
-## 4. Module-Level Selectors
+## 4. Selection and Checkpoint Replacement
 
-### 4.1 Stage 1 Class Selection
-
-The selector scans the already-parallelized model by module class name and registers forward pre/post hooks on every matching instance.
-
-- It matches against the user-visible implementation class names in the module's Python MRO; base classes like `nn.Module` and generic mixins are ignored.
-- FSDP2-aware: when FSDP2 composes a module into `FSDPModule + OriginalClass`, the selector skips the dynamic FSDP wrapper and matches the original implementation class name.
-- Every configured class name must match at least one module; empty, untrimmed, or unmatched names raise `ValueError`.
-- If the same module instance matches multiple configured class names, it is registered only once.
-- When a module instance is called multiple times in one forward, each invocation is assigned a monotonically increasing `call_id`.
-
-Implementation: `veomni/distributed/activation_offload/config.py::resolve_module_class_selection`.
-
-### 4.2 Shared Hybrid Selector Schema
-
-Hybrid mode should use the same selector schema for GC and offload:
+### 4.1 Selector schema
 
 ```yaml
 selection:
@@ -164,472 +137,340 @@ selection:
 
 - Values within one field are ORed.
 - When both fields are non-empty, a module must satisfy both the class and path
-  constraints. This lets a path narrow a broad class selection.
+  constraints.
 - Every configured class name and path pattern must match at least one module;
   unmatched selectors fail before training.
-- Logical paths are resolved to module identities before checkpoint wrappers or
-  FSDP2 composition can alter the visible module tree. Later stages consume the
-  resolved identities rather than matching paths again.
+- Logical paths are resolved to module identities before TP, ExtraParallel,
+  checkpoint wrappers, or FSDP2 alter the visible module tree.
+- If the same module instance matches multiple selectors, it is registered
+  once.
 
-Class selection is concise when a class uniquely identifies a computation
-boundary. Path selection is necessary when instances of the same class have
-different roles. For example, `Qwen3_5RMSNorm` includes decoder input/post-
-attention norms and the `q_norm`/`k_norm` modules nested inside attention.
-Selecting the class while checkpointing the containing attention module would
-silently place selected offload modules inside a GC region. The recommended
-Qwen3.5 configuration therefore selects the outer decoder norms by path.
+Path selection is preferred when one implementation class has different roles.
+For example, a norm implementation class may be used for outer decoder norms
+and attention-internal q/k norms.
 
-### 4.3 Nested Offload Selection
+### 4.2 Why a raw module-tree complement is unsafe
 
-If both a parent module and a child module are selected, a saved tensor created inside the child belongs to the **innermost active selected call**. This is implemented by maintaining a `_call_stack` of active selected call IDs and using the top of the stack in `pack_hook`.
+The complement of an offload selection contains parents, children, containers,
+shared instances, and functional operations that do not appear as standalone
+modules. Checkpointing that raw complement would create nested regions or omit
+parts of the original computation.
 
-Nested offload selection is supported with on-demand restore
-(`prefetch: false`). It is rejected with `prefetch: true` because overlapping
-module calls do not define an unambiguous module-level backward prefetch order.
+Instead, the runtime derives a validated activation-memory partition from
+Transformers-style `GradientCheckpointingLayer` boundaries. For each original
+GC region, the planner must:
 
-### 4.4 Hybrid Selection Validation
+1. keep the original region checkpointed when it contains no selected target;
+2. replace the original parent checkpoint when it contains a selected target;
+3. place selected targets outside checkpoint hooks so their saved tensors reach
+   the selective-offload runtime;
+4. checkpoint the remaining non-overlapping compute regions defined by the
+   model partition;
+5. preserve the original module call path, communication hooks, state-dict
+   names, and parameter names.
 
-The first hybrid implementation uses a non-overlapping region model:
+If a selected path cannot be represented by the model's partition, plan
+construction fails with the unmatched or unsupported paths. It must not degrade
+to model-wide GC or threshold offload silently.
 
-- GC targets must not be ancestors or descendants of other GC targets;
-- GC and offload targets must not be ancestors or descendants of one another;
-- Direct overlap between GC and offload target sets is rejected;
-- A GC target shared under multiple logical paths is rejected because replacing
-  only one parent edge would give the shared instance inconsistent semantics;
-- Container modules and arbitrary members of `model.modules()` are not inferred
-  as checkpoint targets;
-- Root/container modules and modules that explicitly opt out through
-  `_supports_selective_gradient_checkpointing = False` cannot be selected for
-  GC. Calls carrying a live KV cache fail at the wrapper boundary.
+The initial implementation supports selecting a complete checkpoint boundary or
+one of its direct computation children. For Qwen3.5, the sample selects the
+decoder-layer mixer (`self_attn`/`linear_attn`) and MLP children. The unselected
+input and post-attention norms receive transparent checkpoint wrappers, while
+unaffected vision or text blocks remain whole-module checkpoint regions.
+
+### 4.3 Region validation
+
+- Selected offload targets must not be the root or pure container modules.
+- Direct duplicate identities are deduplicated.
+- Parent/child offload targets are rejected when prefetch is enabled because a
+  flat reverse call order cannot represent nested backward consumption.
+- Shared module instances with ambiguous logical ownership are rejected.
+- Modules that opt out of activation-memory transformation are rejected.
+- Calls carrying a live KV cache fail at the replacement boundary.
+- Hybrid mode requires non-reentrant GC.
+
+Nested offload-only selection remains valid with on-demand restore when the
+innermost active selected call owns each saved tensor.
+
+### 4.4 Saved-tensor hook ownership
+
+Non-reentrant checkpoint uses internal saved-tensor hooks. Consequently, a
+selected module nested inside an unchanged parent checkpoint cannot be
+offloaded by an outer runtime: the checkpoint hook consumes its saved tensors
+first.
+
+The replacement plan is therefore load-bearing. It moves selected calls outside
+checkpoint-owned regions, while internal tensors of the remaining checkpointed
+regions continue to be owned by PyTorch's checkpoint and recomputation hooks.
+Checkpoint boundary tensors retain ordinary autograd semantics.
+
+Checkpoint contexts must not install identity `saved_tensors_hooks`. PyTorch
+runs only the innermost hook pair; an identity hook inside the checkpoint would
+replace its bookkeeping, retain forward activations, and defeat recomputation.
 
 ---
 
-## 5. Threshold Policy Reuse and Budget Semantics
+## 5. Accelerator Residency Budget
 
-### 5.1 Refactoring `_ActivationOffloadThresholdPolicy`
-
-The decision logic inside the legacy `custom_save_on_cpu` is factored out into a reusable policy class:
+The Stage 2 budget applies to eligible tensors saved by selected modules:
 
 ```python
-class _ActivationOffloadThresholdPolicy:
+class ActivationResidencyPolicy:
     def decide(self, tensor: torch.Tensor) -> OffloadPolicy:
-        # returns IGNORE / KEEP_ON_GPU / OFFLOAD
+        # returns IGNORE / KEEP_ON_ACCELERATOR / OFFLOAD
 ```
 
-`custom_save_on_cpu` now only handles pack/unpack execution; all decisions are delegated to the policy.
+- With `exclude_parameter_views: true`, parameters and storage-sharing views
+  return `IGNORE` and do not consume the activation budget.
+- Eligible selected tensors remain on the accelerator while the live resident
+  byte count fits `activation_gpu_limit`.
+- Further selected tensors use asynchronous D2H offload.
+- The resident byte count is released when autograd releases the packed saved
+  tensor; retained graphs remain charged to the budget.
+- Unselected checkpoint-region tensors are managed by checkpoint hooks rather
+  than this budget.
 
-### 5.2 Selective-Plus-Threshold Semantics
+The limit is deliberately a soft residency budget. A tensor that crosses the
+boundary, restored tensors needed by the current backward operator, and one
+bounded prefetch group may temporarily exceed it. Peak process memory also
+includes parameters, gradients, optimizer state, communication buffers, and
+operator workspaces.
 
-Inside `SelectiveAsyncActivationOffloadRuntime`:
-
-- Saved tensors belonging to the resolved offload selection: **always** use selective async offload and **do not count** against `activation_gpu_limit`.
-- Saved tensors outside selected modules: fall back to `_ActivationOffloadThresholdPolicy.decide(tensor)`:
-  - Within budget → `KEEP_ON_GPU`;
-  - Over budget → legacy synchronous `tensor.cpu()` offload;
-  - Parameters / small tensors / weight transposes → `IGNORE`.
-
-The GPU budget is only tracked for non-selected tensors.
-
-### 5.3 Selective GC Interaction
-
-In hybrid mode:
-
-- Explicit GC targets are wrapped with non-reentrant `torch.utils.checkpoint`;
-- Explicit offload targets remain outside checkpoint regions and use
-  `SelectiveAsyncActivationOffloadRuntime`;
-- The checkpoint's own `_checkpoint_hook` and `_recomputation_hook` are the
-  innermost saved-tensor hooks for a checkpointed region, so internal tensors do
-  not reach the outer selective-offload hook;
-- Checkpoint boundary tensors that remain outside the internal hook use the
-  non-selected threshold policy.
-
-Hybrid checkpointing must use the default/no-op checkpoint context:
-
-```python
-checkpoint(
-    target_module,
-    *args,
-    use_reentrant=False,
-    context_fn=noop_context_fn,
-    early_stop=early_stop,
-    **kwargs,
-)
-```
-
-It must **not** install identity `saved_tensors_hooks` through `context_fn`.
-PyTorch permits only the innermost saved-tensor hook pair to run, and enters the
-forward context inside `_checkpoint_hook`. An identity hook would therefore
-replace the checkpoint hook, retain real forward activations, and defeat
-recomputation.
+When no selection is configured, the legacy threshold implementation and its
+historical semantics remain unchanged for backward compatibility.
 
 ---
 
-## 6. Handle State Machine and Asynchronous Protocol
+## 6. Asynchronous Offload Protocol
 
-### 6.1 Handle States
-
-Each offloaded saved tensor is wrapped by an `ActivationOffloadHandle` with the following state machine:
+Each offloaded saved tensor is represented by an
+`ActivationOffloadHandle`:
 
 ```text
 CREATED
-  → OFFLOAD_QUEUED
-  → HOST_READY
-  → PREFETCH_QUEUED
-  → DEVICE_READY
-  → RELEASED
+  -> OFFLOAD_QUEUED
+  -> HOST_READY
+  -> PREFETCH_QUEUED
+  -> DEVICE_READY
+  -> RELEASED
 ```
 
-State transitions are driven by stream events, not by CPU polling.
-
-### 6.2 Asynchronous D2H Protocol
+### 6.1 D2H
 
 ```text
 compute stream:  [ produce T ] [ producer_event ]
-                                      │
-offload stream:                       └──wait──► [ D2H T ] [ d2h_event ]
+                                      |
+offload stream:                       +--wait--> [ D2H T ] [ d2h_event ]
 ```
 
-```python
-current_stream = _current_stream(device)
-producer_event.record(current_stream)
-offload_stream.wait_event(producer_event)
+- The producer event prevents D2H from reading an incomplete tensor.
+- `tensor.record_stream(offload_stream)` prevents allocator reuse before D2H
+  completes.
+- The D2H event prevents H2D from reading an incomplete host buffer.
 
-with offload_stream:
-    cpu_buffer.copy_(tensor, non_blocking=True)
-    d2h_event.record(offload_stream)
-
-tensor.record_stream(offload_stream)
-```
-
-| Mechanism | Purpose |
-|---|---|
-| `producer_event` | Prevents the offload stream from reading `tensor` before its producer kernel completes. |
-| `tensor.record_stream(offload_stream)` | Prevents the allocator from reusing the source storage before D2H completes. |
-| `d2h_event` | Prevents H2D from reading the CPU buffer before D2H finishes. |
-
-### 6.3 Asynchronous H2D Protocol
-
-Prefetch stage:
+### 6.2 H2D and consumption
 
 ```text
-prefetch stream:  [ wait d2h_event ][ H2D T' ][ h2d_event ]
+prefetch stream: [ wait d2h_event ] [ H2D T' ] [ h2d_event ]
+backward stream:                                  [ wait ] [ consume T' ]
 ```
 
-Consumption stage:
+The restored tensor records the consumer stream. NPU uses the platform-specific
+event synchronization required by torch-npu; CUDA keeps the non-blocking stream
+wait path.
 
-```python
-backward_stream.wait_event(h2d_event)
-restored_tensor.record_stream(backward_stream)
-```
+### 6.3 Idempotency and lifetime
 
-### 6.4 Idempotency
+- Prefetch submission is idempotent.
+- Repeated unpack is supported.
+- After consumption, the handle keeps only the durable CPU copy and a weak
+  reference to any restored device tensor.
+- A retained graph may restore the tensor again from the CPU copy.
+- With prefetch disabled, the runtime does not retain packed handles after their
+  owning backward call starts.
 
-```python
-def ensure_device_resident(self, block: bool = True) -> torch.Tensor:
-    if self.state == HandleState.DEVICE_READY:
-        return self.restored_tensor
-    if self.state == HandleState.PREFETCH_QUEUED and not block:
-        return self.restored_tensor
-    ...
-```
-
-- `block=False`: used by the prefetch scheduler; only submits H2D and returns immediately.
-- `block=True`: used by `unpack_hook`; waits until H2D completes before returning.
-- After an unpack returns, the handle keeps only a weak reference to the device
-  copy. This permits repeated unpack while the consumer is live without keeping
-  all restored activations alive until Python cyclic GC. A retained graph can
-  restore the tensor again from the durable CPU copy.
-
-### 6.5 CPU Fallback
-
-When the device type is `cpu` or dedicated streams cannot be created, the handle transparently falls back to synchronous `.cpu()` / `.to(device)` copies, enabling CPU/Mac unit tests.
+CPU execution or unavailable dedicated streams use a synchronous fallback for
+unit testing.
 
 ---
 
-## 7. Backward Prefetch Scheduler
+## 7. Backward Prefetch
 
-### 7.1 Trigger Timing
-
-The runtime records the forward order of selected calls:
+Hybrid prefetch uses recomputation as the overlap window:
 
 ```text
-forward:  M0 → M1 → M2 → M3
-backward: M3 → M2 → M1 → M0
+backward: [ recompute GC region N ] [ backward offload region N-1 ]
+                    +-- prefetch activation group for N-1 --+
 ```
 
-- Entering the backward context triggers prefetch for `M3`.
-- When `M3`'s first saved tensor is unpacked, the runtime triggers prefetch for `M2`.
-- And so on.
+The planner records the forward order of selected calls and checkpoint
+boundaries. At backward time, entry into a checkpoint recomputation context may
+submit at most the next bounded group. The first unpack of a selected call
+retires that group and advances scheduling.
 
-Implementation: `start_backward()` submits the last selected call, then the
-first `unpack_hook` for each call looks up the previous call ID in
-`_forward_order` and invokes `_prefetch_call(prev_call_id)`. Scheduling from
-unpack avoids output-tensor hooks retaining completed autograd graphs across
-gradient-accumulation micro-batches.
+Stage 1 has no checkpoint boundary, so it starts with the final selected call
+and advances in reverse forward order on the first unpack for each call.
 
-### 7.2 Duplicate-Trigger Safety
-
-Multiple tensors from the same selected call may be unpacked. The runtime marks
-the call on its first unpack, and the idempotent `ensure_device_resident`
-guarantees that no duplicate H2D copy is issued.
+Prefetch reduces host-visible H2D waits only when the recomputation window is
+long enough and transfer does not interfere with FSDP communication. It is a
+workload-tuned optimization, not a guaranteed throughput improvement.
 
 ---
 
-## 8. Trainer Integration
+## 8. Trainer and FSDP2 Integration
 
-### 8.1 Construction Point
+The build order is:
 
-`BaseTrainer._build_training_context()` is changed to:
+1. Resolve offload selectors against logical paths and module identities.
+2. When GC and selection are both enabled, build the model-specific checkpoint
+   replacement plan. Do not call model-wide
+   `model.gradient_checkpointing_enable()` for the same regions.
+3. Apply tensor parallelism, then transformations required by the
+   ExtraParallel plan.
+4. Install transparent non-reentrant checkpoint wrappers for the plan's GC
+   regions without changing state-dict or parameter names.
+5. Apply FSDP2 while retaining resolved identities.
+6. Install selective-offload hooks directly on the resolved offload targets.
+7. Build forward/backward runtime contexts and lifecycle cleanup.
 
-```python
-def _build_training_context(self):
-    self.activation_offload_runtime = build_activation_offload_runtime(
-        model=self.model,
-        offload_config=self.args.train.accelerator.offload_config,
-        enable_gradient_checkpointing=self.args.train.gradient_checkpointing.enable,
-        enable_compile=self.args.train.torch_compile.enable,
-    )
-    self.model_fwd_context = self.activation_offload_runtime.forward_context
-    self.model_bwd_context = self.activation_offload_runtime.backward_context
-```
+The checkpoint wrapper must checkpoint the target module call, not a captured
+`module.forward` method. Directly invoking a captured method during
+recomputation can bypass FSDP2, TP, and normal module hooks.
 
-**Important:** `_build_training_context()` must be called **after** `parallelize_model_fsdp2(model)`, otherwise FSDP2 composition may change class names and prevent matching the original implementation classes.
-
-### 8.2 Hybrid Checkpoint Installation
-
-When both selections are present, `build_parallelize_model()` must skip the
-model-wide `model.gradient_checkpointing_enable()` call and install checkpoint
-wrappers only on the resolved GC targets.
-
-The wrapper must checkpoint the target **module call**, not a captured
-`module.forward` method. Calling a captured `forward` directly during
-recomputation can bypass FSDP2, TP, and ordinary module hooks. The wrapper must
-also preserve state-dict keys and expose the underlying implementation class to
-parallel-plan and selector logic.
-
-The implementation subclasses PyTorch's non-reentrant `CheckpointWrapper`. In
-addition to its state-dict prefix hooks, the VeOmni wrapper preserves logical
-`named_modules()` / `named_parameters()` paths so model loading, LoRA matching,
-optimizer grouping, and checkpoint keys do not acquire a
-`._checkpoint_wrapped_module.` component.
-
-The intended build sequence is:
-
-1. Resolve GC and offload selectors to logical paths and module identities;
-2. Apply transformations required by the module's parallel plan;
-3. Install transparent non-reentrant checkpoint wrappers on explicit GC targets
-   without changing parameter state-dict names;
-4. Apply FSDP2 while retaining the resolved module identities;
-5. Build the selective-offload runtime on the parallelized model using the
-   resolved offload targets.
-
-The exact placement relative to TP and ExtraParallel must be validated by
-distributed tests. In every case, recomputation must re-enter the module-call
-path that owns the relevant communication hooks.
-
-### 8.3 Lifecycle Cleanup
-
-`BaseTrainer.on_train_end()` is extended to call:
-
-```python
-if getattr(self, "activation_offload_runtime", None) is not None:
-    self.activation_offload_runtime.log_summary()
-    self.activation_offload_runtime.close()
-```
-
-`close()` removes all module forward hooks, clears handle indexes / call stacks / forward-order lists, releases cached streams, and frees internal buffers.
-
-`log_summary()` reports offloaded bytes, prefetch hits, on-demand restores, threshold fallback counts, and peak pinned memory.
-
-### 8.4 `model_fwd_context` and `model_bwd_context`
-
-- `forward_context` is a context manager that installs `saved_tensors_hooks` during model forward;
-- When autograd needs to save an intermediate tensor for backward, it invokes `pack_hook`, which decides whether to keep the tensor on the accelerator or offload it to CPU;
-- During backward, autograd calls the recorded `unpack_hook` to restore the tensor to the original device for gradient computation;
-- In the legacy threshold path with model-wide GC, `model_bwd_context` handles
-  tensors saved during recomputation;
-- In hybrid mode, tensors internal to an explicit GC target are owned by
-  PyTorch's checkpoint/recomputation hooks and must not be selectively
-  offloaded. The selective runtime continues to restore the handles created by
-  offload targets outside those regions.
+`BaseTrainer`, `TextDPOTrainer`, `DiTTrainer`, and any composed trainer that
+overrides forward/backward lifecycle handling must all start and finish the
+activation-offload runtime. Unsupported trainer families must reject hybrid
+mode explicitly.
 
 ---
 
-## 9. `build_activation_offload_runtime` Factory
-
-This factory selects the correct runtime implementation based on configuration:
+## 9. Runtime Selection
 
 ```text
 enable_activation=false
-   └── NullActivationOffloadRuntime
+  -> NullActivationOffloadRuntime
 
-enable_activation=true
-   ├── no selection
-   │     └── ActivationOffloadThresholdRuntime
-   ├── selection + GC on + no GC selection
-   │     └── warning + ActivationOffloadThresholdRuntime (legacy behavior)
-   ├── selection + torch.compile=true
-   │     └── error
-   ├── selection + GC off + compile off
-   │     └── SelectiveAsyncActivationOffloadRuntime
-   └── selection + explicit non-reentrant GC selection + compile off
-         └── SelectiveAsyncActivationOffloadRuntime
-               + selective checkpoint plan
+enable_activation=true, no selection
+  -> ThresholdActivationOffloadRuntime
+
+selection, GC disabled, compile disabled
+  -> SelectiveAsyncActivationOffloadRuntime (Stage 1)
+
+selection, GC enabled, non-reentrant, compile disabled
+  -> checkpoint replacement plan
+     + SelectiveAsyncActivationOffloadRuntime (Stage 2 / mode B)
+
+selection with unsupported GC partition, reentrant GC, ChunkMBS, or compile
+  -> configuration error before training
 ```
 
-`ActivationOffloadThresholdRuntime` internally reuses the existing `build_activation_offloading_context()` to preserve legacy behavior.
-
-The activation-offload factory does not infer GC targets. The selective
-checkpoint plan is built from `gradient_checkpointing.selection` and supplied
-alongside the selective runtime by the training setup.
+The factory never ignores a configured selection. In hybrid mode it receives
+the already-resolved offload targets and checkpoint replacement plan from the
+training setup.
 
 ---
 
-## 10. Chunk Loss Compatibility Fix
+## 10. Compatibility and Migration
 
-### 10.1 Problem
+This Stage 2 definition intentionally changes the meaning of one previously
+accepted combination:
 
-`veomni/ops/kernels/cross_entropy/chunk_loss.py` originally used `torch.func.grad_and_value`. This API is a functorch functional transform and does **not** compose safely with outer `saved_tensors_hooks`. When activation offloading installs `saved_tensors_hooks(pack_hook, unpack_hook)`, calling `torch.func.grad_and_value(...)` inside `ChunkLoss.forward` either silently bypasses the hooks or raises an error, preventing offloading of chunk-CE activations.
+- Previously, GC enabled plus an offload selection but no explicit GC selection
+  logged a warning and ignored the selection.
+- After Stage 2 is implemented, the same configuration activates checkpoint
+  replacement hybrid mode.
 
-### 10.2 Fix
-
-Replace `torch.func.grad_and_value` with `torch.autograd.grad`, and isolate the inner short-lived graph with identity hooks so that only the final `grad_inputs` and `grad_weight` buffers are visible to the outer activation-offload hooks:
-
-```python
-with torch.enable_grad(), saved_tensors_hooks(lambda x: x, lambda x: x):
-    chunk_input = hidden_states_chunk.detach().requires_grad_(True)
-    chunk_weight = head_weight.detach().requires_grad_(True)
-    chunk_loss, _ = loss_forward(chunk_input, chunk_weight, None, **loss_kwargs_chunks[i])
-    chunk_grad_input, chunk_grad_weight = torch.autograd.grad(
-        chunk_loss,
-        (chunk_input, chunk_weight),
-    )
-```
-
-Fix commit: `c4b61690d6208309adddd5f05dd2ac143707fdb6`.
-
-This identity-hook usage is local to the chunk-loss inner autograd graph. It
-must not be reused as a non-reentrant checkpoint `context_fn`, where it would
-override the checkpoint's own saved-tensor hooks.
+`gradient_checkpointing.selection` remains supported for compatibility with
+existing explicit non-overlapping plans, but it is no longer required for the
+standard hybrid configuration. Existing configurations without any selection
+retain their legacy behavior.
 
 ---
 
-## 11. Test Plan
+## 11. Chunk Loss Compatibility
 
-### 11.1 Unit Tests
+Chunk loss must use `torch.autograd.grad`, not `torch.func.grad_and_value`,
+because functorch functional transforms do not compose safely with outer
+saved-tensor hooks. Its inner short-lived graph may use identity hooks so only
+the final gradient buffers are visible to the outer runtime.
 
-- Config parsing and validation;
-- Shared class/path module selection, including FSDP2 composition, duplicate
-  selectors, and unmatched-selector errors;
-- Rejection of nested/overlapping GC and offload regions;
-- Rejection of reentrant GC, ChunkMBS, and `torch.compile` in selective-GC mode;
-- Threshold policy budget behavior;
-- `custom_save_on_cpu` delegation to the policy;
-- Factory branches (disabled / threshold / selective / GC fallback / hybrid /
-  compile rejection);
-- Handle state machine and idempotent restore;
-- Prefetch triggering and nested-selection attribution;
-- Hybrid execution counters: GC targets execute once in forward and once in
-  recomputation, while offload targets outside those regions execute only once;
-- GC-internal saved tensors do not reach the selective pack hook, while selected
-  offload tensors do;
-- State-dict keys are unchanged after installing selective checkpoint wrappers;
-- Chunk-loss numerical equivalence after the fix.
-
-### 11.2 Accelerator Tests
-
-- D2H waits for the producer stream;
-- Source storage is not reused before D2H completes;
-- H2D waits for D2H completion;
-- Backward only waits for relevant prefetch events;
-- Repeated prefetch triggers issue only one H2D copy;
-- No device-wide synchronizations on the steady path.
-- FSDP2/TP/ExtraParallel communication hooks are re-entered correctly during
-  recomputation of wrapped targets.
-
-### 11.3 Qwen3.5 Integration Tests
-
-- Single-device forward/backward equivalence on a toy Dense model;
-- FSDP2 multi-device equivalence;
-- Ulysses sequence parallelism with sizes 1, 2, and 4;
-- Multiple gradient-accumulation micro-batches;
-- Qwen3.5 Dense 9B: GDN-only, FA-only, and GDN+FA selection configurations.
-- Qwen3.5 hybrid configuration: attention/GDN/MLP recomputation plus outer
-  decoder-RMSNorm asynchronous offload.
-- Compare hybrid mode with model-wide GC at the same batch/sequence shape using
-  steady-state step time, peak accelerator memory, and D2H/H2D bytes.
-
-### 11.4 Measured Hybrid Results
-
-On two Ascend 910B2 devices with Qwen3-0.6B, FSDP2 DP2, sequence length
-16,384, global/micro batch size 16/1, and six steps, a hybrid plan that
-checkpoints every MLP and selectively offloads every decoder input/post-attention
-RMSNorm was measured twice:
-
-| Mode | Mean step time | Peak NPU memory |
-|---|---:|---:|
-| Model-wide GC | 9.96 s, 10.20 s | 8.64 GiB |
-| MLP-only GC, no offload control | 8.80 s | 22.27 GiB |
-| MLP-only GC + selective RMSNorm offload | 8.54 s, 8.56 s | 20.52 GiB |
-
-The two-run means are 10.08 s for model-wide GC and 8.55 s for hybrid mode:
-hybrid reduces step latency by 15.2% (17.9% higher throughput). Relative to the
-same selective-GC plan without offload, selective offload reduces peak memory
-by 1.75 GiB (7.9%); its roughly 0.25 s timing difference is too small to claim
-as an independent speedup. The benefit is therefore a tunable memory/compute
-tradeoff, not a free reduction in both time and memory: hybrid uses 11.88 GiB
-more memory than model-wide GC because attention is no longer recomputed.
-
-All modes produced losses `2.14, 2.31, 2.20, 1.97, 1.88, 1.97`. The hybrid
-runtime moved 90,308,755,488 bytes in each direction per rank across six steps,
-with no threshold fallback. On this NPU, `prefetch: true` did not improve this
-workload, so the demonstrated configuration uses `prefetch: false`.
-
-The RFC's original Qwen3.5-9B plan (attention/GDN/MLP GC plus outer-norm
-offload) did not show a benefit at sequence length 4,096: model-wide GC took
-15.93 s/step at 48.05 GiB, while hybrid took 18.19 s/step at 49.08 GiB. This is
-recorded to make clear that selector quality is model- and workload-dependent;
-the Qwen3-0.6B result must not be generalized to that Qwen3.5 plan.
+This identity-hook use is local to chunk loss. It must not be reused as a
+non-reentrant checkpoint context, where it would replace checkpoint bookkeeping.
 
 ---
 
-## 12. Risks and Notes
+## 12. Test Plan
 
-| Risk | Notes |
+### 12.1 Configuration and planning
+
+- Parse the single-selector hybrid configuration.
+- Verify GC plus selection activates replacement mode instead of legacy fallback.
+- Preserve explicit `gradient_checkpointing.selection` plans for compatibility.
+- Resolve class/path selectors before wrappers and FSDP composition.
+- Reject unmatched, shared, nested-prefetch, and unsupported-partition targets.
+- Reject reentrant GC, ChunkMBS, and `torch.compile` in hybrid mode.
+- Preserve ordinary model-wide GC when no selection is present.
+
+### 12.2 Correctness
+
+- Selected targets execute once and restore saved activations during backward.
+- Remaining GC targets execute once in forward and once in recomputation.
+- Selected tensors reach the offload pack hook; checkpoint-internal tensors do not.
+- State-dict, named-parameter, optimizer-group, and LoRA matching keys are unchanged.
+- Losses and gradients match mode C within the established numerical tolerance.
+- FSDP2, TP, ExtraParallel, and Ulysses communication hooks are re-entered correctly.
+- Multiple gradient-accumulation micro-batches do not retain completed graphs or handles.
+
+### 12.3 Memory and performance
+
+- Measure peak accelerator memory for A, B with limit 0, B with a positive
+  limit, and C at the same batch and sequence shape.
+- Report selected resident bytes, D2H/H2D bytes, prefetch hits, on-demand
+  restores, peak pinned memory, and threshold fallback counts.
+- Verify no device-wide synchronization on the steady path.
+- Compare prefetch enabled/disabled; do not claim a win below repeat-to-repeat noise.
+- Treat B's memory proximity to C as a measured acceptance threshold, not an API guarantee.
+
+---
+
+## 13. Existing Evidence and Risks
+
+The existing Qwen3.5-9B experiments evaluated the previous explicit selective-GC
+design, not the replacement semantics in this RFC. On four Ascend 910B2 devices
+at sequence length 4,096, model-wide GC measured 16.44 s/step and 48.05 GB peak,
+while the previous hybrid-prefetch plan measured 20.82 s/step and 49.08 GB.
+Broad Attention/GDN or MLP offload also generated tens of GB of transfers per
+step and was slower than GC.
+
+These results motivate the simpler interface but do not validate the sample
+selector as a performance win. The new mode B must be benchmarked independently.
+Selectors should maximize recomputation FLOPs avoided per transferred byte, and
+prefetch should remain workload-tuned.
+
+Key risks:
+
+| Risk | Required handling |
 |---|---|
-| NPU stream/event semantics | Verify that `torch.npu.Stream/Event` behave equivalently to CUDA. |
-| FSDP2 parameter prefetch contention | FSDP2's own H2D traffic may compete with activation H2D for bandwidth. |
-| Pin-memory allocation failure | Large activations may OOM CPU; in this stage we fail loudly rather than silently falling back. |
-| `torch.compile` | Explicitly rejected for selective offload, selective GC, and hybrid mode. |
-| GC + offload selection without explicit GC selection | Falls back to the legacy path for backward compatibility. |
-| Hybrid region overlap | Reject ancestor/descendant relationships in either direction, direct overlap, and nested GC targets. |
-| Wrapper transparency | Checkpoint wrappers must preserve module-call hooks, state-dict keys, and parallel-plan matching. |
-| Stateful modules | Recompute may duplicate mutation or cache updates; unsupported targets must fail validation. |
-| Repeated unpack | Safe due to per-call first-unpack scheduling and the idempotent `ensure_device_resident` design. |
+| Unsupported model partition | Fail before training; never infer a raw module-tree complement. |
+| Peak memory above mode C | Bound residency and prefetch groups; validate with measured peak memory. |
+| FSDP communication contention | Trace H2D and collectives together; disable prefetch when it increases idle time. |
+| Parameter-view traffic | Exclude parameters and storage-sharing views from activation offload. |
+| Pinned-host-memory exhaustion | Track peak pinned bytes and fail loudly on allocation failure. |
+| Stateful modules or live KV cache | Reject unsupported targets during planning or at the wrapper boundary. |
+| `torch.compile` | Reject selective and hybrid modes until hook/wrapper composition is supported. |
 
 ---
 
-## 13. Summary
+## 14. Summary
 
-This RFC proposes a backward-compatible enhancement to activation offloading in VeOmni:
+The Stage 2 public contract is deliberately small:
 
-- Existing behavior is unchanged when no module selection is configured;
-- Stage 1 selective async offload activates when an offload selection is
-  configured, gradient checkpointing is disabled, and `torch.compile` is
-  disabled;
-- Stage 2 hybrid mode is explicitly enabled by providing both a non-reentrant
-  `gradient_checkpointing.selection` and an `offload_config.selection`; no
-  complement of either selection is inferred;
-- GC and offload use the same class/path selector schema, with path selection
-  used to disambiguate instances such as outer decoder norms from attention
-  `q_norm`/`k_norm` modules;
-- Non-reentrant checkpoint's internal saved-tensor hooks isolate recomputed
-  regions from the outer selective-offload runtime; no identity checkpoint
-  context is installed;
-- The core offload logic is encapsulated in `ActivationOffloadHandle` with a state machine supporting asynchronous streams/events and idempotent prefetch;
-- Trainers integrate through the unified `build_activation_offload_runtime` interface, and lifecycle cleanup is handled by `close()` and `log_summary()`.
-
-The Stage 1 implementation and Stage 2 selective-GC integration live on
-`gulihui/async_offload`. Accelerator-scale correctness and performance were
-validated on the configurations in Section 11.4; broader model/selector tuning
-remains workload-specific.
+- GC enabled without an offload selection is mode C;
+- GC enabled with an offload selection is mode B;
+- selected regions use activation offload instead of recomputation;
+- remaining supported regions continue to use GC;
+- `activation_gpu_limit` controls the selected activation residency tradeoff;
+- no public GC selector or replacement mode flag is required;
+- the runtime must construct a validated checkpoint replacement plan or fail
+  before training.

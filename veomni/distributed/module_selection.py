@@ -41,10 +41,11 @@ class ActivationMemoryPlan:
 
     gradient_checkpoint_targets: tuple[ResolvedModuleSelection, ...] = ()
     activation_offload_targets: tuple[ResolvedModuleSelection, ...] = ()
+    checkpoint_plan_enabled: bool = False
 
     @property
     def selective_gradient_checkpointing(self) -> bool:
-        return bool(self.gradient_checkpoint_targets)
+        return self.checkpoint_plan_enabled or bool(self.gradient_checkpoint_targets)
 
     @property
     def selective_activation_offload(self) -> bool:
@@ -183,6 +184,151 @@ def _all_paths(selection: ResolvedModuleSelection) -> tuple[str, ...]:
     return (selection.module_path, *selection.alias_paths)
 
 
+def _is_gradient_checkpoint_boundary(module: nn.Module) -> bool:
+    """Return whether ``module`` is a Transformers-style GC call boundary."""
+    return bool(getattr(module, "_veomni_gradient_checkpointing_boundary", False)) or any(
+        cls.__name__ == "GradientCheckpointingLayer" for cls in type(module).__mro__
+    )
+
+
+def _resolved_target(
+    module_path: str,
+    module: nn.Module,
+    paths_by_module_id: dict[int, tuple[str, ...]],
+) -> ResolvedModuleSelection:
+    all_paths = paths_by_module_id[id(module)]
+    return ResolvedModuleSelection(
+        module_path=module_path,
+        module=module,
+        alias_paths=tuple(path for path in all_paths if path != module_path),
+    )
+
+
+def resolve_checkpoint_replacement_targets(
+    model: nn.Module,
+    activation_offload_targets: Sequence[ResolvedModuleSelection],
+) -> tuple[ResolvedModuleSelection, ...]:
+    """Derive checkpoint regions when offload replaces model-wide GC.
+
+    Unaffected ``GradientCheckpointingLayer`` instances remain whole-module
+    checkpoint regions. If an offload target is a direct child of a checkpoint
+    boundary, the boundary is split into its direct children: selected children
+    remain unwrapped and every other computation child is checkpointed.
+    Deeper selections are rejected because a raw module-tree complement cannot
+    safely reproduce the original checkpoint boundary.
+    """
+    paths_by_module_id: dict[int, list[str]] = {}
+    modules_by_id: dict[int, nn.Module] = {}
+    for module_path, module in model.named_modules(remove_duplicate=False):
+        module_id = id(module)
+        modules_by_id[module_id] = module
+        paths_by_module_id.setdefault(module_id, []).append(module_path)
+    frozen_paths_by_id = {module_id: tuple(paths) for module_id, paths in paths_by_module_id.items()}
+
+    boundaries: list[ResolvedModuleSelection] = []
+    for module_id, module in modules_by_id.items():
+        if not _is_gradient_checkpoint_boundary(module):
+            continue
+        paths = frozen_paths_by_id[module_id]
+        if len(paths) != 1:
+            raise ValueError(
+                f"Gradient-checkpoint boundary {paths[0]!r} is shared through aliases {paths[1:]!r}; "
+                "automatic checkpoint replacement requires unique ownership."
+            )
+        boundaries.append(_resolved_target(paths[0], module, frozen_paths_by_id))
+
+    if not boundaries:
+        raise ValueError(
+            "Activation offload cannot replace model-wide gradient checkpointing because the model exposes no "
+            "GradientCheckpointingLayer boundaries. Disable gradient checkpointing or provide an explicit "
+            "gradient_checkpointing.selection."
+        )
+
+    for index, boundary in enumerate(boundaries):
+        for other in boundaries[index + 1 :]:
+            if _is_ancestor_path(boundary.module_path, other.module_path) or _is_ancestor_path(
+                other.module_path, boundary.module_path
+            ):
+                raise ValueError(
+                    "Automatic checkpoint replacement does not support nested GradientCheckpointingLayer "
+                    f"boundaries: {boundary.module_path!r} and {other.module_path!r}."
+                )
+
+    affected_children: dict[int, set[int]] = {}
+    fully_offloaded_boundaries: set[int] = set()
+    for target in activation_offload_targets:
+        if target.alias_paths:
+            raise ValueError(
+                f"Automatic checkpoint replacement does not support shared offload target {target.module_path!r} "
+                f"with aliases {target.alias_paths!r}."
+            )
+
+        containing = [
+            boundary
+            for boundary in boundaries
+            if boundary.module_path == target.module_path
+            or _is_ancestor_path(boundary.module_path, target.module_path)
+        ]
+        if not containing:
+            containing_boundaries = [
+                boundary for boundary in boundaries if _is_ancestor_path(target.module_path, boundary.module_path)
+            ]
+            if containing_boundaries:
+                raise ValueError(
+                    f"Offload target {target.module_path!r} contains gradient-checkpoint boundaries; select a "
+                    "boundary or one of its direct computation children instead."
+                )
+            continue
+
+        boundary = max(containing, key=lambda item: item.module_path.count("."))
+        boundary_id = id(boundary.module)
+        if target.module is boundary.module:
+            fully_offloaded_boundaries.add(boundary_id)
+            continue
+
+        relative_path = target.module_path[len(boundary.module_path) + 1 :]
+        if "." in relative_path:
+            raise ValueError(
+                f"Offload target {target.module_path!r} is nested below checkpoint boundary "
+                f"{boundary.module_path!r}. Automatic replacement supports only the boundary itself or its "
+                "direct computation children."
+            )
+        direct_child = boundary.module._modules.get(relative_path)
+        if direct_child is not target.module:
+            raise RuntimeError(
+                f"Offload target identity for {target.module_path!r} changed while building the checkpoint plan."
+            )
+        affected_children.setdefault(boundary_id, set()).add(id(target.module))
+
+    checkpoint_targets: list[ResolvedModuleSelection] = []
+    for boundary in boundaries:
+        boundary_id = id(boundary.module)
+        if boundary_id in fully_offloaded_boundaries:
+            if boundary_id in affected_children:
+                raise ValueError(
+                    f"Offload selection contains checkpoint boundary {boundary.module_path!r} and one of its children."
+                )
+            continue
+
+        selected_child_ids = affected_children.get(boundary_id)
+        if selected_child_ids is None:
+            checkpoint_targets.append(boundary)
+            continue
+
+        for child_name, child in boundary.module.named_children():
+            if id(child) in selected_child_ids:
+                continue
+            if isinstance(child, (nn.ModuleDict, nn.ModuleList, nn.Sequential)):
+                raise TypeError(
+                    f"Checkpoint boundary {boundary.module_path!r} contains container child {child_name!r}; "
+                    "automatic replacement requires explicit computation children."
+                )
+            child_path = f"{boundary.module_path}.{child_name}"
+            checkpoint_targets.append(_resolved_target(child_path, child, frozen_paths_by_id))
+
+    return tuple(checkpoint_targets)
+
+
 def validate_activation_memory_regions(
     gradient_checkpoint_targets: Sequence[ResolvedModuleSelection],
     activation_offload_targets: Sequence[ResolvedModuleSelection],
@@ -239,19 +385,24 @@ def resolve_activation_memory_plan(
     """Resolve active selectors once against the logical pre-parallel model tree."""
     gradient_checkpoint_targets: tuple[ResolvedModuleSelection, ...] = ()
     activation_offload_targets: tuple[ResolvedModuleSelection, ...] = ()
+    checkpoint_plan_enabled = False
 
     checkpoint_selection = getattr(gradient_checkpointing_config, "selection", None)
     if getattr(gradient_checkpointing_config, "enable", False) and checkpoint_selection is not None:
         gradient_checkpoint_targets = resolve_module_selection(model, checkpoint_selection)
+        checkpoint_plan_enabled = True
 
     offload_selection = getattr(offload_config, "selection", None)
     offload_enabled = getattr(offload_config, "enable_activation", False)
-    model_wide_checkpointing = getattr(gradient_checkpointing_config, "enable", False) and checkpoint_selection is None
-    if offload_enabled and offload_selection is not None and not model_wide_checkpointing:
+    if offload_enabled and offload_selection is not None:
         activation_offload_targets = resolve_module_selection(model, offload_selection)
+        if getattr(gradient_checkpointing_config, "enable", False) and checkpoint_selection is None:
+            gradient_checkpoint_targets = resolve_checkpoint_replacement_targets(model, activation_offload_targets)
+            checkpoint_plan_enabled = True
 
     validate_activation_memory_regions(gradient_checkpoint_targets, activation_offload_targets)
     return ActivationMemoryPlan(
         gradient_checkpoint_targets=gradient_checkpoint_targets,
         activation_offload_targets=activation_offload_targets,
+        checkpoint_plan_enabled=checkpoint_plan_enabled,
     )

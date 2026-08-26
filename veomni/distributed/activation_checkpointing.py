@@ -16,6 +16,7 @@
 
 import inspect
 from collections.abc import Iterator, Sequence
+from contextlib import AbstractContextManager
 from typing import Any, Optional
 
 from torch import nn
@@ -41,11 +42,19 @@ class TransparentCheckpointWrapper(CheckpointWrapper):
     _veomni_selective_checkpoint_wrapper = True
 
     def __init__(self, module: nn.Module, **checkpoint_fn_kwargs: Any) -> None:
-        super().__init__(module, **checkpoint_fn_kwargs)
+        self._veomni_checkpoint_context_fn = checkpoint_fn_kwargs.pop("context_fn", noop_context_fn)
+        super().__init__(module, context_fn=self._checkpoint_contexts, **checkpoint_fn_kwargs)
         try:
             self._veomni_forward_signature: Optional[inspect.Signature] = inspect.signature(module.forward)
         except (TypeError, ValueError):
             self._veomni_forward_signature = None
+
+    def _checkpoint_contexts(self) -> tuple[AbstractContextManager, AbstractContextManager]:
+        return self._veomni_checkpoint_context_fn()
+
+    def set_checkpoint_context_fn(self, context_fn: Any) -> None:
+        """Install contexts used to observe original forward and recomputation."""
+        self._veomni_checkpoint_context_fn = context_fn
 
     def named_modules(
         self,

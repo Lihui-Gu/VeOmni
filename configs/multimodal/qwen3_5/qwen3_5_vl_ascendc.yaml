@@ -31,15 +31,16 @@ train:
     fsdp_config:
       fsdp_mode: fsdp2
     offload_config:
-      enable_activation: true
-      activation_gpu_limit: 2.0
+      enable_activation: false
+      exclude_parameter_views: true
   gradient_checkpointing:
-    enable: false
+    enable: true
     enable_reentrant: false
+    early_stop: true
   wandb:
     enable: false
     project: VeOmni
-    name: Qwen3.5-9B-vl-sft-selective-offload
+    name: Qwen3.5-9B-vl-sft-hybrid-activation
   freeze_vit: false
   optimizer:
     lr: 1.0e-5
@@ -51,10 +52,10 @@ train:
   init_device: meta
   profile:
     enable: false
-    start_step: 20
-    end_step: 21
+    start_step: 10
+    end_step: 11
     record_shapes: true
   checkpoint:
-    output_dir: Qwen3.5-9B-vl-sft-selective-offload
+    output_dir: Qwen3.5-9B-vl-sft-hybrid-activation
     manager: dcp
     save_hf_weights: false

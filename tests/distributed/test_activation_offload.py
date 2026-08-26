@@ -82,6 +82,7 @@ train:
         module_classes:
           - SelectedBlock
       prefetch: true
+      exclude_parameter_views: true
 """
     )
     monkeypatch.setattr("sys.argv", ["test", str(config_path)])
@@ -93,6 +94,7 @@ train:
     assert offload.activation_gpu_limit == 2.0
     assert offload.selection == ActivationOffloadSelectionConfig(module_classes=["SelectedBlock"])
     assert offload.prefetch is True
+    assert offload.exclude_parameter_views is True
 
 
 def test_selective_offload_config_parses_from_cli(monkeypatch):
@@ -113,6 +115,8 @@ def test_selective_offload_config_parses_from_cli(monkeypatch):
             "OtherBlock",
             "--train.accelerator.offload_config.prefetch",
             "true",
+            "--train.accelerator.offload_config.exclude_parameter_views",
+            "true",
         ],
     )
 
@@ -121,9 +125,10 @@ def test_selective_offload_config_parses_from_cli(monkeypatch):
     offload = args.train.accelerator.offload_config
     assert offload.selection == ActivationOffloadSelectionConfig(module_classes=["SelectedBlock", "OtherBlock"])
     assert offload.prefetch is True
+    assert offload.exclude_parameter_views is True
 
 
-def test_hybrid_selection_config_parses_from_yaml(tmp_path, monkeypatch):
+def test_checkpoint_replacement_config_parses_from_yaml(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         """
@@ -135,27 +140,27 @@ train:
   gradient_checkpointing:
     enable: true
     enable_reentrant: false
-    selection:
-      module_paths:
-        - "**.layers.*.mlp"
   accelerator:
     offload_config:
       enable_activation: true
       selection:
-        module_classes:
-          - SelectedBlock
         module_paths:
-          - "**.input_layernorm"
+          - "**.layers.*.self_attn"
+          - "**.layers.*.linear_attn"
+          - "**.layers.*.mlp"
 """
     )
     monkeypatch.setattr("sys.argv", ["test", str(config_path)])
 
     args = parse_args(VeOmniArguments)
 
-    assert args.train.gradient_checkpointing.selection == ModuleSelectionConfig(module_paths=["**.layers.*.mlp"])
+    assert args.train.gradient_checkpointing.selection is None
     assert args.train.accelerator.offload_config.selection == ModuleSelectionConfig(
-        module_classes=["SelectedBlock"],
-        module_paths=["**.input_layernorm"],
+        module_paths=[
+            "**.layers.*.self_attn",
+            "**.layers.*.linear_attn",
+            "**.layers.*.mlp",
+        ]
     )
 
 
@@ -177,6 +182,19 @@ def test_selective_gradient_checkpointing_rejects_reentrant_mode():
                 enable_reentrant=True,
                 selection=ModuleSelectionConfig(module_paths=["block"]),
             )
+        )
+
+
+def test_checkpoint_replacement_rejects_reentrant_mode():
+    with pytest.raises(ValueError, match="Checkpoint-replacement activation offload requires enable_reentrant=False"):
+        TrainingArguments(
+            accelerator=AcceleratorConfig(
+                offload_config=OffloadConfig(
+                    enable_activation=True,
+                    selection=ModuleSelectionConfig(module_paths=["block.offloaded"]),
+                )
+            ),
+            gradient_checkpointing=GradientCheckpointingConfig(enable=True, enable_reentrant=True),
         )
 
 
@@ -215,6 +233,7 @@ train:
     assert offload.activation_gpu_limit == 2.0
     assert offload.selection is None
     assert offload.prefetch is False
+    assert offload.exclude_parameter_views is False
 
 
 def test_legacy_offload_config_defaults_are_unchanged():
@@ -234,7 +253,7 @@ def test_legacy_offload_config_defaults_are_unchanged():
     assert fwd_context.policy.gpu_limit_in_mb == 2.0 * 1024
 
 
-def test_gradient_checkpointing_warns_and_keeps_legacy_threshold_contexts(monkeypatch):
+def test_gradient_checkpointing_accepts_checkpoint_replacement_config(monkeypatch):
     warning_messages = []
     monkeypatch.setattr(
         "veomni.arguments.arguments_types.logger.warning_rank0",
@@ -251,18 +270,7 @@ def test_gradient_checkpointing_warns_and_keeps_legacy_threshold_contexts(monkey
         gradient_checkpointing=GradientCheckpointingConfig(enable=True),
     )
 
-    fwd_context, bwd_context = build_activation_offloading_context(
-        enable_activation=offload.enable_activation,
-        enable_gradient_checkpointing=True,
-        activation_gpu_limit=offload.activation_gpu_limit,
-    )
-
-    assert len(warning_messages) == 1
-    assert "falling back to the legacy threshold" in warning_messages[0]
-    assert isinstance(fwd_context, custom_save_on_cpu)
-    assert isinstance(bwd_context, custom_save_on_cpu)
-    assert fwd_context.policy.gpu_limit_in_mb == 0.0
-    assert bwd_context.policy.gpu_limit_in_mb == 2.0 * 1024
+    assert warning_messages == []
 
 
 def test_selective_offload_rejects_torch_compile():
@@ -372,6 +380,30 @@ class _RegionSelectionModel(nn.Module):
         self.block = _RegionParent()
 
 
+class _CheckpointBoundary(nn.Module):
+    _veomni_gradient_checkpointing_boundary = True
+
+    def __init__(self):
+        super().__init__()
+        self.checkpointed = _CountingLinear(4, 4)
+        self.offloaded = _CountingLinear(4, 4)
+        self.forward_calls = 0
+
+    def forward(self, hidden_states):
+        self.forward_calls += 1
+        return self.offloaded(torch.sin(self.checkpointed(hidden_states)))
+
+
+class _CheckpointReplacementModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.affected = _CheckpointBoundary()
+        self.unaffected = _CheckpointBoundary()
+
+    def forward(self, hidden_states):
+        return self.unaffected(torch.sin(self.affected(hidden_states)))
+
+
 def test_activation_memory_plan_rejects_nested_gc_targets():
     model = _RegionSelectionModel()
     checkpointing = GradientCheckpointingConfig(
@@ -396,6 +428,66 @@ def test_activation_memory_plan_rejects_gc_offload_overlap():
 
     with pytest.raises(ValueError, match="must not overlap or be nested"):
         resolve_activation_memory_plan(model, checkpointing, offload)
+
+
+def test_activation_memory_plan_derives_checkpoint_replacement_from_offload_selection():
+    model = _CheckpointReplacementModel()
+    checkpointing = GradientCheckpointingConfig(enable=True)
+    offload = OffloadConfig(
+        enable_activation=True,
+        selection=ModuleSelectionConfig(module_paths=["affected.offloaded"]),
+    )
+
+    plan = resolve_activation_memory_plan(model, checkpointing, offload)
+
+    assert plan.selective_gradient_checkpointing is True
+    assert [target.module_path for target in plan.gradient_checkpoint_targets] == [
+        "affected.checkpointed",
+        "unaffected",
+    ]
+    assert [target.module_path for target in plan.activation_offload_targets] == ["affected.offloaded"]
+
+
+def test_activation_memory_plan_rejects_deep_automatic_replacement_target():
+    model = _CheckpointReplacementModel()
+    model.affected.offloaded.extra = nn.ReLU()
+    checkpointing = GradientCheckpointingConfig(enable=True)
+    offload = OffloadConfig(
+        enable_activation=True,
+        selection=ModuleSelectionConfig(module_paths=["affected.offloaded.extra"]),
+    )
+
+    with pytest.raises(ValueError, match="supports only the boundary itself or its direct computation children"):
+        resolve_activation_memory_plan(model, checkpointing, offload)
+
+
+def test_activation_memory_plan_can_replace_all_checkpoint_boundaries():
+    model = _CheckpointReplacementModel()
+    offload = OffloadConfig(
+        enable_activation=True,
+        selection=ModuleSelectionConfig(module_paths=["affected", "unaffected"]),
+        prefetch=True,
+    )
+
+    plan = resolve_activation_memory_plan(model, GradientCheckpointingConfig(enable=True), offload)
+
+    assert plan.selective_gradient_checkpointing is True
+    assert plan.gradient_checkpoint_targets == ()
+    model._veomni_selective_checkpoint_wrappers = install_selective_checkpoint_wrappers(
+        model,
+        plan.gradient_checkpoint_targets,
+        early_stop=True,
+    )
+    runtime = build_activation_offload_runtime(
+        model,
+        offload,
+        enable_gradient_checkpointing=True,
+        enable_selective_gradient_checkpointing=plan.selective_gradient_checkpointing,
+        resolved_selection=plan.activation_offload_targets,
+    )
+
+    assert runtime.use_checkpoint_recompute_prefetch is False
+    runtime.close()
 
 
 def test_threshold_policy_preserves_legacy_budget_behavior():
@@ -471,6 +563,47 @@ class _HybridToyModel(nn.Module):
         return self.offloaded(torch.sin(self.checkpointed(hidden_states)))
 
 
+class _CheckpointPrefetchToyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.offloaded_first = _CountingLinear(4, 4)
+        self.checkpointed_first = _CountingLinear(4, 4)
+        self.offloaded_second = _CountingLinear(4, 4)
+        self.offloaded_unused = _CountingLinear(4, 4)
+        self.checkpointed_second = _CountingLinear(4, 4)
+
+    def forward(self, hidden_states):
+        hidden_states = self.offloaded_first(hidden_states)
+        hidden_states = torch.sin(self.checkpointed_first(hidden_states))
+        hidden_states = self.offloaded_second(hidden_states)
+        self.offloaded_unused(hidden_states)
+        return torch.sin(self.checkpointed_second(hidden_states))
+
+
+class _TrailingOffloadToyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.checkpointed = _CountingLinear(4, 4)
+        self.offloaded = _CountingLinear(4, 4)
+
+    def forward(self, hidden_states):
+        hidden_states = torch.sin(self.checkpointed(hidden_states))
+        return self.offloaded(hidden_states)
+
+
+class _LongCheckpointWindowToyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.offloaded = _CountingLinear(4, 4)
+        self.checkpointed_first = _CountingLinear(4, 4)
+        self.checkpointed_second = _CountingLinear(4, 4)
+
+    def forward(self, hidden_states):
+        hidden_states = self.offloaded(hidden_states)
+        hidden_states = torch.sin(self.checkpointed_first(hidden_states))
+        return torch.sin(self.checkpointed_second(hidden_states))
+
+
 class _MultiOutputSelectedBlock(nn.Module):
     def __init__(self):
         super().__init__()
@@ -487,6 +620,7 @@ def _make_offload_config(
     selection_module_classes=None,
     selection_module_paths=None,
     prefetch: bool = False,
+    exclude_parameter_views: bool = False,
 ):
     selection = None
     if selection_module_classes or selection_module_paths:
@@ -499,6 +633,7 @@ def _make_offload_config(
         activation_gpu_limit=activation_gpu_limit,
         selection=selection,
         prefetch=prefetch,
+        exclude_parameter_views=exclude_parameter_views,
     )
 
 
@@ -559,24 +694,32 @@ def test_activation_offload_handle_restores_after_device_copy_is_released():
     torch.testing.assert_close(restored_again.cpu(), expected)
 
 
-def test_build_runtime_fallback_to_threshold_when_gradient_checkpointing():
+def test_build_runtime_rejects_gradient_checkpointing_without_resolved_plan():
     config = _make_offload_config(
         activation_gpu_limit=2.0,
         selection_module_classes=["_SelectedLinear"],
     )
-    runtime = build_activation_offload_runtime(
-        _RuntimeToyModel(),
-        config,
-        enable_gradient_checkpointing=True,
-    )
+    with pytest.raises(ValueError, match="requires an installed checkpoint-replacement plan"):
+        build_activation_offload_runtime(
+            _RuntimeToyModel(),
+            config,
+            enable_gradient_checkpointing=True,
+        )
 
-    assert isinstance(runtime, ThresholdActivationOffloadRuntime)
+    with pytest.raises(ValueError, match="requires an installed checkpoint-replacement plan"):
+        build_activation_offload_runtime(
+            _RuntimeToyModel(),
+            config,
+            enable_gradient_checkpointing=True,
+            enable_selective_gradient_checkpointing=True,
+        )
 
 
 def test_build_runtime_enables_hybrid_with_resolved_selection():
     model = _RuntimeToyModel()
     config = _make_offload_config(selection_module_paths=["selected"])
     resolved = resolve_module_selection(model, config.selection)
+    model._veomni_selective_checkpoint_wrappers = ()
 
     runtime = build_activation_offload_runtime(
         model,
@@ -615,6 +758,105 @@ def test_selective_runtime_offloads_and_restores_selected_tensors():
     runtime.close()
 
 
+def test_selective_runtime_can_exclude_parameter_views():
+    model = _RuntimeToyModel()
+    config = _make_offload_config(
+        activation_gpu_limit=0.0,
+        selection_module_classes=["_SelectedLinear"],
+        exclude_parameter_views=True,
+    )
+    runtime = build_activation_offload_runtime(model, config)
+
+    model_input = torch.randn(128, 4, requires_grad=True)
+    with runtime.forward_context:
+        output = model(model_input)
+    with runtime.backward_context:
+        output.sum().backward()
+
+    assert model_input.grad is not None
+    assert runtime.stats.num_offloaded_tensors > 0
+    assert runtime.stats.num_parameter_views_skipped > 0
+    assert (
+        runtime.stats.parameter_view_bytes_skipped
+        >= model.selected.weight.numel() * model.selected.weight.element_size()
+    )
+    runtime.close()
+
+
+def test_selective_runtime_keeps_selected_activations_within_gpu_budget():
+    model = _RuntimeToyModel()
+    runtime = build_activation_offload_runtime(
+        model,
+        _make_offload_config(
+            activation_gpu_limit=1024.0,
+            selection_module_classes=["_SelectedLinear"],
+        ),
+    )
+
+    model_input = torch.randn(128, 4, requires_grad=True)
+    with runtime.forward_context:
+        output = model(model_input)
+
+    assert runtime.stats.num_threshold_keep_on_gpu > 0
+    assert runtime.stats.num_offloaded_tensors == 0
+
+    with runtime.backward_context:
+        output.sum().backward()
+
+    assert runtime.threshold_policy.cur_gpu_ram_in_mb == pytest.approx(0.0)
+    runtime.close()
+
+
+def test_selective_runtime_releases_unused_residency_budget_with_packed_object():
+    model = _RuntimeToyModel()
+    runtime = build_activation_offload_runtime(
+        model,
+        _make_offload_config(
+            activation_gpu_limit=1024.0,
+            selection_module_classes=["_SelectedLinear"],
+        ),
+    )
+    runtime._call_stack.append(1)
+    packed = runtime.pack_hook(torch.ones(128))
+
+    assert runtime.threshold_policy.cur_gpu_ram_in_mb > 0
+
+    packed_ref = weakref.ref(packed)
+    del packed
+    gc.collect()
+
+    assert packed_ref() is None
+    assert runtime.threshold_policy.cur_gpu_ram_in_mb == pytest.approx(0.0)
+    runtime.close()
+
+
+def test_selective_runtime_keeps_residency_budget_for_retained_graph():
+    model = _RuntimeToyModel()
+    runtime = build_activation_offload_runtime(
+        model,
+        _make_offload_config(
+            activation_gpu_limit=1024.0,
+            selection_module_classes=["_SelectedLinear"],
+        ),
+    )
+    model_input = torch.randn(128, 4, requires_grad=True)
+
+    with runtime.forward_context:
+        output = model(model_input)
+    reserved_mb = runtime.threshold_policy.cur_gpu_ram_in_mb
+    with runtime.backward_context:
+        output.sum().backward(retain_graph=True)
+
+    assert reserved_mb > 0
+    assert runtime.threshold_policy.cur_gpu_ram_in_mb == pytest.approx(reserved_mb)
+
+    del output
+    gc.collect()
+
+    assert runtime.threshold_policy.cur_gpu_ram_in_mb == pytest.approx(0.0)
+    runtime.close()
+
+
 def test_hybrid_runtime_recomputes_only_gc_target_and_offloads_sibling():
     model = _HybridToyModel()
     checkpointing = GradientCheckpointingConfig(
@@ -622,11 +864,15 @@ def test_hybrid_runtime_recomputes_only_gc_target_and_offloads_sibling():
         selection=ModuleSelectionConfig(module_paths=["checkpointed"]),
     )
     config = _make_offload_config(
-        activation_gpu_limit=1024.0,
+        activation_gpu_limit=0.0,
         selection_module_paths=["offloaded"],
     )
     plan = resolve_activation_memory_plan(model, checkpointing, config)
-    install_selective_checkpoint_wrappers(model, plan.gradient_checkpoint_targets, early_stop=True)
+    model._veomni_selective_checkpoint_wrappers = install_selective_checkpoint_wrappers(
+        model,
+        plan.gradient_checkpoint_targets,
+        early_stop=True,
+    )
     runtime = build_activation_offload_runtime(
         model,
         config,
@@ -635,7 +881,7 @@ def test_hybrid_runtime_recomputes_only_gc_target_and_offloads_sibling():
         resolved_selection=plan.activation_offload_targets,
     )
 
-    hidden_states = torch.randn(2, 4, requires_grad=True)
+    hidden_states = torch.randn(128, 4, requires_grad=True)
     with runtime.forward_context:
         output = model(hidden_states)
     with runtime.backward_context:
@@ -645,6 +891,168 @@ def test_hybrid_runtime_recomputes_only_gc_target_and_offloads_sibling():
     assert model.offloaded.forward_calls == 1
     assert runtime.stats.num_offloaded_tensors > 0
     assert hidden_states.grad is not None
+    runtime.close()
+
+
+def test_checkpoint_replacement_recomputes_unselected_regions_and_offloads_selected_region():
+    model = _CheckpointReplacementModel()
+    original_checkpointed = model.affected.checkpointed
+    original_offloaded = model.affected.offloaded
+    original_unaffected = model.unaffected
+    config = _make_offload_config(
+        selection_module_paths=["affected.offloaded"],
+    )
+    plan = resolve_activation_memory_plan(model, GradientCheckpointingConfig(enable=True), config)
+    model._veomni_selective_checkpoint_wrappers = install_selective_checkpoint_wrappers(
+        model,
+        plan.gradient_checkpoint_targets,
+        early_stop=True,
+    )
+    runtime = build_activation_offload_runtime(
+        model,
+        config,
+        enable_gradient_checkpointing=True,
+        enable_selective_gradient_checkpointing=plan.selective_gradient_checkpointing,
+        resolved_selection=plan.activation_offload_targets,
+    )
+
+    hidden_states = torch.randn(128, 4, requires_grad=True)
+    with runtime.forward_context:
+        output = model(hidden_states)
+    with runtime.backward_context:
+        output.sum().backward()
+
+    assert original_checkpointed.forward_calls == 2
+    assert original_offloaded.forward_calls == 1
+    assert original_unaffected.forward_calls == 2
+    assert runtime.stats.num_offloaded_tensors > 0
+    assert hidden_states.grad is not None
+    runtime.close()
+
+
+def test_checkpoint_recompute_prefetch_groups_selected_calls_between_boundaries():
+    model = _CheckpointPrefetchToyModel()
+    checkpoint_targets = resolve_module_selection(
+        model,
+        ModuleSelectionConfig(module_paths=["checkpointed_first", "checkpointed_second"]),
+    )
+    model._veomni_selective_checkpoint_wrappers = install_selective_checkpoint_wrappers(
+        model,
+        checkpoint_targets,
+        early_stop=True,
+    )
+    config = _make_offload_config(
+        selection_module_paths=["offloaded_first", "offloaded_second", "offloaded_unused"],
+        prefetch=True,
+    )
+    runtime = build_activation_offload_runtime(
+        model,
+        config,
+        enable_gradient_checkpointing=True,
+        enable_selective_gradient_checkpointing=True,
+    )
+
+    hidden_states = torch.randn(128, 4, requires_grad=True)
+    with runtime.forward_context:
+        output = model(hidden_states)
+    with runtime.backward_context:
+        output.sum().backward()
+
+    assert hidden_states.grad is not None
+    assert model.checkpointed_first.forward_calls == 2
+    assert model.checkpointed_second.forward_calls == 2
+    assert runtime.use_checkpoint_recompute_prefetch is True
+    assert runtime.stats.num_checkpoint_prefetch_groups == 2
+    assert runtime.stats.num_prefetch_hits == runtime.stats.num_offloaded_tensors
+    runtime.close()
+
+
+def test_checkpoint_recompute_prefetch_starts_trailing_selected_group_before_backward():
+    model = _TrailingOffloadToyModel()
+    checkpoint_targets = resolve_module_selection(
+        model,
+        ModuleSelectionConfig(module_paths=["checkpointed"]),
+    )
+    model._veomni_selective_checkpoint_wrappers = install_selective_checkpoint_wrappers(
+        model,
+        checkpoint_targets,
+        early_stop=True,
+    )
+    config = _make_offload_config(
+        selection_module_paths=["offloaded"],
+        prefetch=True,
+    )
+    runtime = build_activation_offload_runtime(
+        model,
+        config,
+        enable_gradient_checkpointing=True,
+        enable_selective_gradient_checkpointing=True,
+    )
+
+    hidden_states = torch.randn(128, 4, requires_grad=True)
+    with runtime.forward_context:
+        output = model(hidden_states)
+    with runtime.backward_context:
+        output.sum().backward()
+
+    assert hidden_states.grad is not None
+    assert model.checkpointed.forward_calls == 2
+    assert model.offloaded.forward_calls == 1
+    assert runtime.stats.num_checkpoint_prefetch_groups == 1
+    assert runtime.stats.num_prefetch_hits == runtime.stats.num_offloaded_tensors
+    runtime.close()
+
+
+def test_checkpoint_recompute_prefetch_survives_multiple_recompute_boundaries():
+    model = _LongCheckpointWindowToyModel()
+    checkpoint_targets = resolve_module_selection(
+        model,
+        ModuleSelectionConfig(module_paths=["checkpointed_first", "checkpointed_second"]),
+    )
+    model._veomni_selective_checkpoint_wrappers = install_selective_checkpoint_wrappers(
+        model,
+        checkpoint_targets,
+        early_stop=True,
+    )
+    config = _make_offload_config(
+        selection_module_paths=["offloaded"],
+        prefetch=True,
+    )
+    runtime = build_activation_offload_runtime(
+        model,
+        config,
+        enable_gradient_checkpointing=True,
+        enable_selective_gradient_checkpointing=True,
+    )
+    events = []
+    original_begin_backward_call = runtime._begin_backward_call
+    original_retire_group = runtime._retire_active_checkpoint_prefetch_group
+
+    def record_begin_backward_call(call_id):
+        if call_id not in runtime._backward_started_call_ids:
+            events.append(("consume", call_id))
+        return original_begin_backward_call(call_id)
+
+    def record_retire_group():
+        if runtime._active_checkpoint_prefetch_call_ids:
+            events.append(("retire", tuple(runtime._active_checkpoint_prefetch_call_ids)))
+        return original_retire_group()
+
+    runtime._begin_backward_call = record_begin_backward_call
+    runtime._retire_active_checkpoint_prefetch_group = record_retire_group
+
+    hidden_states = torch.randn(128, 4, requires_grad=True)
+    with runtime.forward_context:
+        output = model(hidden_states)
+    with runtime.backward_context:
+        output.sum().backward()
+
+    assert hidden_states.grad is not None
+    assert model.checkpointed_first.forward_calls == 2
+    assert model.checkpointed_second.forward_calls == 2
+    assert [event[0] for event in events] == ["consume"]
+    assert runtime.stats.num_checkpoint_prefetch_groups == 1
+    assert runtime.stats.num_prefetch_hits == runtime.stats.num_offloaded_tensors
     runtime.close()
 
 

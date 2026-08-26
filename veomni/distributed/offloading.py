@@ -40,10 +40,16 @@ class _ActivationOffloadThresholdPolicy:
         self.gpu_limit_in_mb = gpu_limit_in_gb * 1024
         self.min_offload_size = min_offload_size
 
-    def decide(self, tensor: torch.Tensor, is_param: bool = False) -> OffloadPolicy:
+    def decide(
+        self,
+        tensor: torch.Tensor,
+        is_param: bool = False,
+        min_offload_size: Optional[int] = None,
+    ) -> OffloadPolicy:
         tensor_num_bytes = tensor.element_size() * tensor.nelement()
+        effective_min_offload_size = self.min_offload_size if min_offload_size is None else min_offload_size
         # heuristic to skip nn.Linear.weight
-        if is_param or type(tensor.grad_fn).__name__ == "TBackward0" or tensor_num_bytes <= self.min_offload_size:
+        if is_param or type(tensor.grad_fn).__name__ == "TBackward0" or tensor_num_bytes <= effective_min_offload_size:
             return OffloadPolicy.IGNORE
 
         # Keep the historical boundary behavior: the tensor that crosses the
@@ -56,8 +62,11 @@ class _ActivationOffloadThresholdPolicy:
 
     def release(self, offload_policy: OffloadPolicy, tensor: torch.Tensor) -> None:
         if offload_policy == OffloadPolicy.KEEP_ON_GPU:
-            tensor_num_bytes = tensor.element_size() * tensor.nelement()
-            self.cur_gpu_ram_in_mb -= tensor_num_bytes / 1024 / 1024
+            self.release_bytes(tensor.element_size() * tensor.nelement())
+
+    def release_bytes(self, tensor_num_bytes: int) -> None:
+        """Release a previously reserved number of accelerator bytes."""
+        self.cur_gpu_ram_in_mb = max(0.0, self.cur_gpu_ram_in_mb - tensor_num_bytes / 1024 / 1024)
 
 
 class custom_save_on_cpu(saved_tensors_hooks):

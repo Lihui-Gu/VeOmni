@@ -629,8 +629,6 @@ def build_parallelize_model(
     if selective_checkpoint_targets is not None:
         if not enable_gradient_checkpointing:
             raise ValueError("Selective checkpoint targets require enable_gradient_checkpointing=True.")
-        if not selective_checkpoint_targets:
-            raise ValueError("Selective gradient checkpointing requires at least one resolved target.")
         if use_reentrant:
             raise ValueError("Selective gradient checkpointing requires enable_reentrant=False.")
         if compile_config.enable:

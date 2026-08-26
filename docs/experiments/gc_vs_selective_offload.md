@@ -124,6 +124,23 @@ q/k-norm variants also failed to beat model-wide GC. This negative result is
 important: a selector must be tuned to the model and memory target rather than
 assumed to improve every workload.
 
+Run the Qwen3.5-9B full-GC, selective-GC, and hybrid comparison with:
+
+```bash
+MODEL_PATH=/path/to/Qwen3.5-9B \
+DATA_PATH=./tulu-3-sft-mixture/data \
+NPU_DEVICES=0,2,4,6 MAX_STEPS=20 REPEATS=3 \
+  bash scripts/profile/run_qwen3_5_gc_vs_hybrid.sh compare
+```
+
+The script also accepts `upper`, `gc`, `selective-gc`, `hybrid`,
+`hybrid-prefetch`, and `all`. With multiple repetitions, comparison suites
+rotate their run order to reduce cache, temperature, and fixed-order bias.
+Each case preserves its raw log and resolved config below
+`output/qwen3_5_gc_vs_hybrid/repro_<timestamp>/`; `manifest.txt` records the
+shared launch settings and `summary.txt` collects the final timing, memory, and
+offload-counter lines. Set `GDN_IMPL=npu` if `fla_npu` is unavailable.
+
 The commands below reproduce the separate Stage 1 upper-bound comparison with
 the existing Qwen3.5 text config. They avoid the expensive whole-Attention/GDN
 selection and differ only in the settings under test.

@@ -531,7 +531,10 @@ class OffloadConfig:
     activation_gpu_limit: float = field(
         default=0.0,
         metadata={
-            "help": "When enabling activation offload, `activation_gpu_limit` GB activations are allowed to reserve on GPU."
+            "help": (
+                "Soft GiB budget for eligible activations retained on the accelerator. "
+                "Selected activations participate in this budget."
+            )
         },
     )
     selection: Optional[ModuleSelectionConfig] = field(
@@ -541,6 +544,15 @@ class OffloadConfig:
     prefetch: bool = field(
         default=False,
         metadata={"help": "Prefetch the next selected module's activations during backward."},
+    )
+    exclude_parameter_views: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Keep parameter tensors and their storage-sharing views on the accelerator when selectively "
+                "offloading a module's saved tensors."
+            )
+        },
     )
 
 
@@ -945,11 +957,12 @@ class TrainingArguments:
             return
 
         if checkpointing.enable and checkpointing.selection is None:
-            logger.warning_rank0(
-                "Activation-offload module selection and prefetch are ignored when gradient checkpointing is enabled; "
-                "falling back to the legacy threshold activation-offload path."
-            )
-            return
+            if checkpointing.enable_reentrant:
+                raise ValueError("Checkpoint-replacement activation offload requires enable_reentrant=False.")
+            if self.chunk_mbs_config.enable:
+                raise ValueError(
+                    "Checkpoint-replacement activation offload is not supported with train.chunk_mbs_config.enable."
+                )
 
         if self.torch_compile.enable:
             raise ValueError(

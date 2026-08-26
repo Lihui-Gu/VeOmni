@@ -32,21 +32,18 @@ train:
       fsdp_mode: fsdp2
     offload_config:
       enable_activation: true
-      activation_gpu_limit: 80
+      activation_gpu_limit: 2.0
       selection:
         module_paths:
-          - "**.layers.*.input_layernorm"
-          - "**.layers.*.post_attention_layernorm"
-      prefetch: false
+          - "**.layers.*.self_attn"
+          - "**.layers.*.linear_attn"
+          - "**.layers.*.mlp"
+      prefetch: true
+      exclude_parameter_views: true
   gradient_checkpointing:
     enable: true
     enable_reentrant: false
     early_stop: true
-    selection:
-      module_paths:
-        - "**.layers.*.self_attn"
-        - "**.layers.*.linear_attn"
-        - "**.layers.*.mlp"
   wandb:
     enable: false
     project: VeOmni
@@ -62,8 +59,8 @@ train:
   init_device: meta
   profile:
     enable: false
-    start_step: 20
-    end_step: 21
+    start_step: 10
+    end_step: 11
     record_shapes: true
   checkpoint:
     output_dir: Qwen3.5-9B-vl-sft-hybrid-activation

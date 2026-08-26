@@ -42,8 +42,9 @@ def build_activation_offload_runtime(
             is configured.
         offload_config: Parsed ``train.accelerator.offload_config``.
         enable_gradient_checkpointing: Whether any gradient checkpointing is enabled.
-        enable_selective_gradient_checkpointing: Whether checkpointing targets
-            were explicitly resolved. Selective offload may coexist with this mode.
+        enable_selective_gradient_checkpointing: Whether a selective checkpoint
+            plan was resolved and installed. Selective offload may coexist with
+            this mode.
         enable_compile: Whether ``torch.compile`` is enabled. Incompatible with
             selective offload.
 
@@ -60,15 +61,9 @@ def build_activation_offload_runtime(
             enable_gradient_checkpointing=enable_gradient_checkpointing,
         )
 
-    # Selection is configured. Validation (GC fallback / compile rejection)
+    # Selection is configured. Validation (GC replacement / compile rejection)
     # has already been performed by VeOmniArguments, but we keep defensive checks
     # here because the factory may be called independently of args parsing.
-    if enable_gradient_checkpointing and not enable_selective_gradient_checkpointing:
-        return ThresholdActivationOffloadRuntime(
-            activation_gpu_limit=offload_config.activation_gpu_limit,
-            enable_gradient_checkpointing=True,
-        )
-
     if enable_compile:
         raise ValueError(
             "Selective activation offload is not supported with torch.compile. "
@@ -78,8 +73,24 @@ def build_activation_offload_runtime(
     if model is None:
         raise ValueError("model is required when activation offload module selection is configured.")
 
+    checkpoint_plan_owner = model
+    if not hasattr(checkpoint_plan_owner, "_veomni_selective_checkpoint_wrappers"):
+        wrapped_model = getattr(model, "module", None)
+        if isinstance(wrapped_model, nn.Module):
+            checkpoint_plan_owner = wrapped_model
+    checkpoint_plan_installed = hasattr(checkpoint_plan_owner, "_veomni_selective_checkpoint_wrappers")
+
+    if enable_gradient_checkpointing and (
+        not enable_selective_gradient_checkpointing or not checkpoint_plan_installed
+    ):
+        raise ValueError(
+            "Selective activation offload with gradient checkpointing requires an installed checkpoint-replacement "
+            "plan. Resolve the activation memory plan and install its checkpoint wrappers before building the runtime."
+        )
+
     return SelectiveAsyncActivationOffloadRuntime(
         model=model,
         offload_config=offload_config,
         resolved_selection=resolved_selection,
+        use_checkpoint_recompute_prefetch=(enable_gradient_checkpointing and enable_selective_gradient_checkpointing),
     )
