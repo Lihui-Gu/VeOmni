@@ -32,12 +32,10 @@ train:
       fsdp_mode: fsdp2
     offload_config:
       enable_activation: true
-      activation_gpu_limit: 2.0
+      activation_gpu_limit: 80
       selection:
         module_paths:
-          - "**.layers.*.self_attn"
           - "**.layers.*.linear_attn"
-          - "**.layers.*.mlp"
       prefetch: true
       exclude_parameter_views: true
   gradient_checkpointing:
@@ -65,4 +63,5 @@ train:
   checkpoint:
     output_dir: Qwen3.5-9B-vl-sft-hybrid-activation
     manager: dcp
+    save_weights: false
     save_hf_weights: false

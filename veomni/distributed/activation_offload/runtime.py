@@ -130,9 +130,11 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         self._backward_started_call_ids: set[int] = set()
         self._handles_by_call_id: Dict[int, List[ActivationOffloadHandle]] = {}
         self._checkpoint_group_cursor = 0
-        self._checkpoint_prefetch_groups: List[Tuple[int, ...]] = []
+        self._checkpoint_boundary_counter = 0
+        self._checkpoint_prefetch_groups: List[Tuple[int, Tuple[int, ...]]] = []
         self._active_checkpoint_prefetch_call_ids: set[int] = set()
-        self._active_checkpoint_prefetch_group_started = False
+        self._active_checkpoint_prefetch_boundary: Optional[int] = None
+        self._prefetch_barrier_events: List[torch.Event] = []
         self._checkpoint_wrappers: List[nn.Module] = []
         self._parameter_storage_keys_by_call_id: Dict[int, set[tuple[str, Optional[int], int]]] = {}
         self._live_handles: weakref.WeakSet[ActivationOffloadHandle] = weakref.WeakSet()
@@ -332,10 +334,12 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         return tensor
 
     def start_backward(self) -> None:
-        """Submit the final forward call before autograd starts consuming it."""
+        """Prepare prefetch state before autograd starts consuming activations."""
         if self.prefetch and self.use_checkpoint_recompute_prefetch:
-            if self._seal_checkpoint_prefetch_group():
-                self._prefetch_next_checkpoint_group()
+            # Calls after the final checkpoint boundary have no recomputation
+            # window in which to hide H2D. Leave them for on-demand restore
+            # instead of racing the first FSDP backward all-gather.
+            self._checkpoint_group_cursor = len(self._forward_order)
         elif self.prefetch and self._forward_order:
             self._prefetch_call(self._forward_order[-1])
 
@@ -348,7 +352,8 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         if self.use_checkpoint_recompute_prefetch:
             if call_id in self._active_checkpoint_prefetch_call_ids:
                 self._active_checkpoint_prefetch_call_ids.discard(call_id)
-                self._active_checkpoint_prefetch_group_started = True
+                if not self._active_checkpoint_prefetch_call_ids:
+                    self._active_checkpoint_prefetch_boundary = None
             return
         try:
             idx = self._forward_order.index(call_id)
@@ -370,10 +375,12 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
 
     def checkpoint_contexts(self) -> tuple[AbstractContextManager, AbstractContextManager]:
         """Seal the preceding offload group and prefetch it during recomputation."""
-        self._seal_checkpoint_prefetch_group()
-        return nullcontext(), _CheckpointRecomputePrefetchContext(self)
+        checkpoint_boundary = self._checkpoint_boundary_counter
+        self._checkpoint_boundary_counter += 1
+        self._seal_checkpoint_prefetch_group(checkpoint_boundary)
+        return nullcontext(), _CheckpointRecomputePrefetchContext(self, checkpoint_boundary)
 
-    def _seal_checkpoint_prefetch_group(self) -> bool:
+    def _seal_checkpoint_prefetch_group(self, checkpoint_boundary: int) -> bool:
         call_ids = tuple(
             call_id
             for call_id in self._forward_order[self._checkpoint_group_cursor :]
@@ -381,19 +388,46 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         )
         self._checkpoint_group_cursor = len(self._forward_order)
         if call_ids:
-            self._checkpoint_prefetch_groups.append(call_ids)
+            self._checkpoint_prefetch_groups.append((checkpoint_boundary, call_ids))
             return True
         return False
 
-    def _prefetch_next_checkpoint_group(self) -> None:
-        if self._active_checkpoint_prefetch_call_ids or not self._checkpoint_prefetch_groups:
+    def _prefetch_for_checkpoint_boundary(self, checkpoint_boundary: int) -> None:
+        """Start one pending group after the current FSDP unshard dependency."""
+        active_boundary = self._active_checkpoint_prefetch_boundary
+        if (
+            self._active_checkpoint_prefetch_call_ids
+            and active_boundary is not None
+            and checkpoint_boundary < active_boundary
+        ):
+            self._retire_active_checkpoint_prefetch_group()
+
+        if self._active_checkpoint_prefetch_call_ids:
             return
-        call_ids = self._checkpoint_prefetch_groups.pop()
-        self._active_checkpoint_prefetch_call_ids.update(call_ids)
-        self._active_checkpoint_prefetch_group_started = False
-        for call_id in call_ids:
-            self._prefetch_call(call_id)
-        self.stats.num_checkpoint_prefetch_groups += 1
+
+        while self._checkpoint_prefetch_groups:
+            target_boundary, call_ids = self._checkpoint_prefetch_groups.pop()
+            if target_boundary > checkpoint_boundary:
+                continue
+            live_call_ids = tuple(call_id for call_id in call_ids if call_id in self._handles_by_call_id)
+            if not live_call_ids:
+                continue
+
+            self._active_checkpoint_prefetch_call_ids.update(live_call_ids)
+            self._active_checkpoint_prefetch_boundary = target_boundary
+            self._order_prefetch_after_current_stream(live_call_ids)
+            for call_id in live_call_ids:
+                self._prefetch_call(call_id)
+            self.stats.num_checkpoint_prefetch_groups += 1
+            return
+
+    def _order_prefetch_after_current_stream(self, call_ids: Tuple[int, ...]) -> None:
+        """Make each device's single prefetch stream wait for the current stream."""
+        devices = {handle.device for call_id in call_ids for handle in self._handles_by_call_id.get(call_id, ())}
+        for device in devices:
+            ready_event = self._stream_cache.order_prefetch_after_current_stream(device)
+            if ready_event is not None:
+                self._prefetch_barrier_events.append(ready_event)
 
     def _retire_active_checkpoint_prefetch_group(self) -> None:
         """Release prefetched calls left unused when the next GC boundary starts."""
@@ -401,7 +435,7 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
             for handle in self._handles_by_call_id.pop(call_id, ()):
                 handle.release_restored_tensor()
         self._active_checkpoint_prefetch_call_ids.clear()
-        self._active_checkpoint_prefetch_group_started = False
+        self._active_checkpoint_prefetch_boundary = None
 
     def finish_backward(self) -> None:
         """Release per-step device copies and indexes."""
@@ -412,9 +446,11 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
         self._backward_started_call_ids.clear()
         self._handles_by_call_id.clear()
         self._checkpoint_group_cursor = 0
+        self._checkpoint_boundary_counter = 0
         self._checkpoint_prefetch_groups.clear()
         self._active_checkpoint_prefetch_call_ids.clear()
-        self._active_checkpoint_prefetch_group_started = False
+        self._active_checkpoint_prefetch_boundary = None
+        self._prefetch_barrier_events.clear()
         self._parameter_storage_keys_by_call_id.clear()
         self._live_handles.clear()
 
@@ -451,13 +487,12 @@ class SelectiveAsyncActivationOffloadRuntime(BaseActivationOffloadRuntime):
 class _CheckpointRecomputePrefetchContext:
     """Trigger one pending activation group when checkpoint recomputation starts."""
 
-    def __init__(self, runtime: SelectiveAsyncActivationOffloadRuntime) -> None:
+    def __init__(self, runtime: SelectiveAsyncActivationOffloadRuntime, checkpoint_boundary: int) -> None:
         self.runtime = runtime
+        self.checkpoint_boundary = checkpoint_boundary
 
     def __enter__(self) -> "_CheckpointRecomputePrefetchContext":
-        if self.runtime._active_checkpoint_prefetch_group_started:
-            self.runtime._retire_active_checkpoint_prefetch_group()
-        self.runtime._prefetch_next_checkpoint_group()
+        self.runtime._prefetch_for_checkpoint_boundary(self.checkpoint_boundary)
         return self
 
     def __exit__(self, *exc_info) -> None:

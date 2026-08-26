@@ -30,6 +30,7 @@ from veomni.distributed.activation_offload import (
     resolve_module_class_selection,
     resolve_module_selection,
 )
+from veomni.distributed.activation_offload import utils as activation_offload_utils
 from veomni.distributed.module_selection import resolve_activation_memory_plan
 from veomni.distributed.offloading import (
     OffloadPolicy,
@@ -967,7 +968,7 @@ def test_checkpoint_recompute_prefetch_groups_selected_calls_between_boundaries(
     runtime.close()
 
 
-def test_checkpoint_recompute_prefetch_starts_trailing_selected_group_before_backward():
+def test_checkpoint_recompute_prefetch_leaves_trailing_selected_group_on_demand():
     model = _TrailingOffloadToyModel()
     checkpoint_targets = resolve_module_selection(
         model,
@@ -998,8 +999,9 @@ def test_checkpoint_recompute_prefetch_starts_trailing_selected_group_before_bac
     assert hidden_states.grad is not None
     assert model.checkpointed.forward_calls == 2
     assert model.offloaded.forward_calls == 1
-    assert runtime.stats.num_checkpoint_prefetch_groups == 1
-    assert runtime.stats.num_prefetch_hits == runtime.stats.num_offloaded_tensors
+    assert runtime.stats.num_checkpoint_prefetch_groups == 0
+    assert runtime.stats.num_prefetch_hits == 0
+    assert runtime.stats.num_ondemand_restores == runtime.stats.num_offloaded_tensors
     runtime.close()
 
 
@@ -1053,6 +1055,98 @@ def test_checkpoint_recompute_prefetch_survives_multiple_recompute_boundaries():
     assert [event[0] for event in events] == ["consume"]
     assert runtime.stats.num_checkpoint_prefetch_groups == 1
     assert runtime.stats.num_prefetch_hits == runtime.stats.num_offloaded_tensors
+    runtime.close()
+
+
+def test_checkpoint_recompute_prefetch_orders_copy_after_current_stream(monkeypatch):
+    model = _RuntimeToyModel()
+    runtime = build_activation_offload_runtime(
+        model,
+        _make_offload_config(selection_module_classes=["_SelectedLinear"], prefetch=True),
+    )
+    tensor = torch.ones(2, requires_grad=True)
+    handle = ActivationOffloadHandle(tensor, call_id=1)
+    handle.offload(tensor)
+    runtime._handles_by_call_id = {1: [handle]}
+    runtime._checkpoint_prefetch_groups = [(0, (1,))]
+    events = []
+
+    def record_stream_order(device):
+        events.append(("barrier", device))
+        return object()
+
+    def record_prefetch(call_id):
+        events.append(("prefetch", call_id))
+
+    monkeypatch.setattr(runtime._stream_cache, "order_prefetch_after_current_stream", record_stream_order)
+    monkeypatch.setattr(runtime, "_prefetch_call", record_prefetch)
+
+    runtime._prefetch_for_checkpoint_boundary(0)
+
+    assert events == [("barrier", tensor.device), ("prefetch", 1)]
+    assert len(runtime._prefetch_barrier_events) == 1
+    runtime.close()
+
+
+def test_prefetch_stream_is_reused_and_waits_for_current_stream(monkeypatch):
+    events = []
+    current_stream = object()
+
+    class FakeEvent:
+        def record(self, stream):
+            events.append(("record", stream))
+
+    class FakeStream:
+        def wait_event(self, event):
+            events.append(("wait", event))
+
+    prefetch_stream = FakeStream()
+    ready_event = FakeEvent()
+    created_streams = []
+
+    def new_stream(device):
+        created_streams.append(device)
+        return prefetch_stream
+
+    monkeypatch.setattr(activation_offload_utils, "_new_stream", new_stream)
+    monkeypatch.setattr(activation_offload_utils, "_new_event", lambda device: ready_event)
+    monkeypatch.setattr(activation_offload_utils, "_current_stream", lambda device: current_stream)
+
+    stream_cache = activation_offload_utils._StreamCache()
+    device = torch.device("cuda:0")
+
+    assert stream_cache.get_prefetch_stream(device) is prefetch_stream
+    assert stream_cache.get_prefetch_stream(device) is prefetch_stream
+    assert stream_cache.order_prefetch_after_current_stream(device) is ready_event
+    assert created_streams == [device]
+    assert events == [("record", current_stream), ("wait", ready_event)]
+
+
+def test_checkpoint_recompute_prefetch_retires_unused_group_at_its_boundary(monkeypatch):
+    model = _RuntimeToyModel()
+    runtime = build_activation_offload_runtime(
+        model,
+        _make_offload_config(selection_module_classes=["_SelectedLinear"], prefetch=True),
+    )
+    tensor = torch.ones(2, requires_grad=True)
+    earlier_handle = ActivationOffloadHandle(tensor, call_id=1)
+    unused_handle = ActivationOffloadHandle(tensor, call_id=2)
+    earlier_handle.offload(tensor)
+    unused_handle.offload(tensor)
+    runtime._handles_by_call_id = {1: [earlier_handle], 2: [unused_handle]}
+    runtime._checkpoint_prefetch_groups = [(0, (1,)), (1, (2,))]
+    prefetched_call_ids = []
+
+    monkeypatch.setattr(runtime._stream_cache, "order_prefetch_after_current_stream", lambda device: None)
+    monkeypatch.setattr(runtime, "_prefetch_call", prefetched_call_ids.append)
+
+    runtime._prefetch_for_checkpoint_boundary(2)
+    runtime._prefetch_for_checkpoint_boundary(1)
+    assert prefetched_call_ids == [2]
+
+    runtime._prefetch_for_checkpoint_boundary(0)
+    assert prefetched_call_ids == [2, 1]
+    assert 2 not in runtime._handles_by_call_id
     runtime.close()
 
 

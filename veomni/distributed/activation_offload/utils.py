@@ -44,6 +44,19 @@ class _StreamCache:
             self._prefetch_streams[device] = _new_stream(device)
         return self._prefetch_streams[device]
 
+    def order_prefetch_after_current_stream(self, device: torch.device) -> Optional[torch.Event]:
+        """Order the cached prefetch stream after work already queued on the current stream."""
+        prefetch_stream = self.get_prefetch_stream(device)
+        current_stream = _current_stream(device)
+        if prefetch_stream is None or current_stream is None:
+            return None
+
+        ready_event = _new_event(device)
+        assert ready_event is not None
+        ready_event.record(current_stream)
+        prefetch_stream.wait_event(ready_event)
+        return ready_event
+
     def clear(self) -> None:
         self._offload_streams.clear()
         self._prefetch_streams.clear()

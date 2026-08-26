@@ -157,7 +157,9 @@ selective-GC targets remain supported for compatibility. Checkpoint targets are 
 and before `fully_shard()`; transparent wrappers preserve state-dict and named-parameter keys. After parallelization,
 `SelectiveAsyncActivationOffloadRuntime` installs hooks on the resolved offload identities. Its residency budget now
 includes selected activations; selected tensors over budget use asynchronous offload, while checkpoint hooks own
-tensors inside recomputed regions.
+tensors inside recomputed regions. Checkpoint-aware H2D prefetch is launched only when backward enters a recomputation
+context. The runtime keeps one prefetch stream per device and orders it after the current compute-stream dependency,
+which FSDP2 establishes after its backward all-gather/copy-out, before overlapping the copy with recomputation.
 
 ## Config Structure
 
