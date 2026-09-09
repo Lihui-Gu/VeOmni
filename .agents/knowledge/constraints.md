@@ -104,6 +104,14 @@ Core entry points:
    - Their local gradient shards are unique across both mesh axes. Gradient clipping must reduce their norm statistic exactly once over `extra_parallel_flat_group(para)`, not through the ordinary sequential `para_fsdp` and `para` groups.
    - Record persistent parameter identities after FSDP wrapping so the ExtraParallel clipper can keep this bucket separate from ordinary sharded and Para-replicated parameters.
    - Persistent PLE may coexist with ordinary EP because their parameters use independent meshes. Every parameter must match at most one enabled ExtraParallel plan; overlapping patterns are rejected before sharding.
+   - Gradient-norm reduction must skip process groups whose world size is one. A singleton Para-FSDP axis is the identity mathematically, while eagerly creating its HCCL communicator can time out on Ascend before the first optimizer step.
+
+8b. **Qwen4-Exp compact QSA indices are global full-resolution token indices**
+   - `qsa_attention_implementation` selects blocks with local queries and globally gathered pooled keys, then all-gathers `[B,L,K]` selections to `[B,S,K]` before the Ulysses attention call.
+   - Index values address global full-resolution K/V directly; `-1` is the only invalid-slot sentinel. Do not rebase them by rank or lift them past a compressed-KV segment.
+   - Packed block boundaries come exclusively from global `cu_seq_lens_q`. Blocks must never cross a packed-sample boundary or be derived from an SP shard boundary.
+   - A compact backend must not construct or silently fall back to an `[S,S]` mask. Unsupported layouts must fail before entering collectives.
+   - The eager backend must not leave gathered `[B,H,S,K,D]` K/V rows in the forward autograd graph. Save only the original Q/K/V plus compact indices, and recompute/scatter one bounded chunk at a time in backward; gradient checkpointing otherwise recreates and retains every gathered chunk during backward recomputation.
 
 ## Data Pipeline
 

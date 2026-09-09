@@ -26,6 +26,7 @@ selection knob.
 | Gated RMSNorm | `rms_norm_gated_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Causal Conv1D | `causal_conv1d_implementation` | `eager`, `fla`, `npu` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
 | Gated delta rule | `chunk_gated_delta_rule_implementation` | `eager`, `fla`, `flash_qla` (SM90), `npu`, `npu_ascendc` | `"fla"` (GPU) | Qwen3.5 OpSlot binding |
+| QSA attention | `qsa_attention_implementation` | `eager` | `"eager"` | Qwen4-Exp compact PyTorch path |
 | Load-balancing loss | `load_balancing_loss_implementation` | `eager`, `triton` (CUDA; NPU config normalizes this default to `eager`) | `"triton"` | `apply_ops_config()` (before model build) |
 | MoE experts | `moe_implementation` | `eager`, `fused_triton`, `fused_quack` (SM90+), `fused_npu` | `"fused_triton"` (GPU) | `build_foundation_model` |
 
@@ -314,6 +315,24 @@ kernel) and `npu_ascendc` (an AscendC fused `torch.ops.npu.*` path), the latter
 requiring a manual `fla_npu` install. Registrations live in
 `veomni/ops/kernels/gated_delta_rule/__init__.py`; field defaults and allowed
 values are documented by `OpsImplementationConfig`.
+
+---
+
+### Qwen4-Exp compact QSA
+
+Qwen4-Exp exposes `qsa_attention_implementation` independently from the normal
+attention backend. Its only supported value, `eager`, uses distributed
+local-query/global-block selection and consumes compact `[B,S,K]` global token
+indices in a chunked PyTorch GQA implementation. It avoids quadratic masks and
+score tensors. A custom autograd function saves only the original Q/K/V and
+compact indices; backward recomputes and scatters one gathered K/V chunk at a
+time so selected rows do not accumulate across the query sequence. This is a
+portable correctness and memory-scaling implementation rather than a fused
+throughput kernel.
+
+The QSA selection lives in the model patch because it owns packed-block and
+Ulysses semantics. The compact attention calculation lives in
+`veomni/ops/kernels/qsa_attention/`.
 
 ---
 

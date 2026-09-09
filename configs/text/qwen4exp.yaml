@@ -1,5 +1,3 @@
-# Internal validation only. Qwen4-Exp currently requires the temporary
-# Transformers git revision pinned in pyproject.toml.
 model:
   model_path: Qwen/Qwen3.8-Flash-Next
   ops_implementation:

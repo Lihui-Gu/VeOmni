@@ -4,11 +4,20 @@ This directory is an internal-validation integration for the experimental
 `qwen4_exp` model from Transformers commit
 `93d1bcfbd2af5798e2f66bf7955e31a537902b64`.
 
-Supported in this first stage:
+Supported in this correctness stage:
 
-- GPU and NPU VLM supervised fine-tuning with `ulysses_size=1` and `cp_size=1`.
-- Eager or SDPA QSA correctness paths.
-- VeOmni fused cross-entropy and fused MoE dispatch.
+- GPU and NPU VLM supervised fine-tuning with Ulysses sequence parallelism and
+  `cp_size=1` for short-sequence validation.
+- GatedDeltaNet sequence-to-head all-to-all using the existing Qwen3.5
+  causal-conv and gated-delta kernels.
+- Global QSA selection plus main-attention Q/K/V Ulysses exchange. The sole
+  `qsa_attention_implementation=eager` path uses local block pooling, compact
+  global token indices, and a memory-bounded sparse PyTorch implementation.
+  Explicit cu-seqlens isolate packed samples consistently for SP=1 and SP>1.
+- PLE n-gram token halos and differentiable dilated-convolution halos across
+  Ulysses shard boundaries.
+- VeOmni fused cross-entropy and fused MoE dispatch, with global router-logit
+  statistics for SP-consistent auxiliary load-balancing loss.
 - Concurrent PLE and MoE expert parallelism: PLE tables use the persistent
   two-dimensional `ple_fsdp × ple` layout while expert tensors use the
   independent `ep_fsdp × ep` layout.
@@ -37,10 +46,21 @@ parallel path are documented in
 
 Known limitations:
 
-- Ulysses/context sequence parallelism is rejected because PLE n-gram context
-  and QSA global token indices need dedicated distributed semantics.
-- The production QSA kernel is not integrated. Upstream eager/SDPA QSA builds
-  dense masks and is suitable only for short correctness validation.
+- Context parallelism, cache prefill/decode, HSDP replicas of persistent PLE,
+  and hybrid CP × Ulysses remain unsupported.
+- A fused production QSA kernel is not integrated. The compact PyTorch backend
+  removes the quadratic mask and attention-score allocation. Its custom
+  autograd path saves only the original Q/K/V tensors and compact indices,
+  then recomputes and scatters one gathered K/V chunk at a time in backward.
+  It still has not passed the 16K performance gate, so the 16K example keeps
+  `ulysses_size=1` pending profiling.
+- Ulysses GatedDeltaNet requires non-eager, varlen-capable causal-conv and
+  chunk gated-delta-rule kernels. Head counts must be divisible by the
+  Ulysses size; QSA KV heads may instead divide the Ulysses size (MQA/GQA
+  replication case).
+- PLE's dilated convolution preserves the upstream SP=1 behavior and does not
+  reset at packed-sample boundaries. Changing that semantic requires a
+  separate SP=1 model change and checkpoint-level validation.
 - Distributed PLE training expects pretrained or DCP weights. Initializing from
   scratch after PLE parameters become DTensors is not supported by the upstream
   Hugging Face initializer.

@@ -54,6 +54,7 @@ veomni/
 │   │   ├── cross_entropy/  eager/liger/npu-chunk loss variants
 │   │   ├── load_balancing_loss/  eager + triton variants
 │   │   ├── mhc/        TileKernels DeepSeek V4 pre/post/head adapters
+│   │   ├── qsa_attention/  Compact-index Qwen sparse GQA adapters
 │   │   ├── rms_norm/   Liger/NPU/batch-invariant Triton RMSNorm
 │   │   ├── rotary/     Liger/NPU + DeepSeek V3 deterministic + Wan Triton
 │   │   ├── swiglu_mlp/ Liger SwiGLU MLP

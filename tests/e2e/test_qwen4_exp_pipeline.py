@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from veomni.utils.device import get_torch_device
+from veomni.utils.import_utils import is_torch_npu_available
 
 from ..tools import DummyDataset, ParallelConfig, build_torchrun_cmd, materialize_weights
 
@@ -13,7 +14,8 @@ from ..tools import DummyDataset, ParallelConfig, build_torchrun_cmd, materializ
 _ACCELERATOR = get_torch_device()
 _TOY_CONFIG = "./tests/toy_config/qwen4_exp_toy/config.json"
 _TRAIN_SCRIPT = "tests/train_scripts/train_qwen4_exp_pipeline_test.py"
-_EAGER_OP_ARGS = [
+_GDN_IMPL = "npu" if is_torch_npu_available() else "fla"
+_OPS_ARGS = [
     "--model.ops_implementation.attn_implementation=eager",
     "--model.ops_implementation.cross_entropy_loss_implementation=eager",
     "--model.ops_implementation.rms_norm_implementation=eager",
@@ -21,9 +23,9 @@ _EAGER_OP_ARGS = [
     "--model.ops_implementation.rotary_pos_emb_implementation=eager",
     "--model.ops_implementation.rotary_pos_emb_vision_implementation=eager",
     "--model.ops_implementation.load_balancing_loss_implementation=eager",
-    "--model.ops_implementation.rms_norm_gated_implementation=eager",
-    "--model.ops_implementation.causal_conv1d_implementation=eager",
-    "--model.ops_implementation.chunk_gated_delta_rule_implementation=eager",
+    f"--model.ops_implementation.rms_norm_gated_implementation={_GDN_IMPL}",
+    f"--model.ops_implementation.causal_conv1d_implementation={_GDN_IMPL}",
+    f"--model.ops_implementation.chunk_gated_delta_rule_implementation={_GDN_IMPL}",
 ]
 _PLE_ARGS = [
     "--train.accelerator.extra_parallel_names=ple",
@@ -69,7 +71,7 @@ def test_qwen4_exp_two_device_training_dcp_resume(tmp_path):
     )
     try:
         common_args = [
-            *_EAGER_OP_ARGS,
+            *_OPS_ARGS,
             *_PLE_ARGS,
             "--data.max_seq_len=64",
             "--data.dataloader.num_workers=0",
@@ -86,7 +88,7 @@ def test_qwen4_exp_two_device_training_dcp_resume(tmp_path):
             model_path=str(model_path),
             train_path=dummy_dataset.save_path,
             output_dir=str(writer_output),
-            parallel_config=ParallelConfig(sp_size=1, ep_size=2, fsdp_mode="fsdp2"),
+            parallel_config=ParallelConfig(sp_size=2, ep_size=2, fsdp_mode="fsdp2"),
             nproc=2,
             extra_args=common_args,
             model_name="qwen4_exp",

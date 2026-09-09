@@ -391,12 +391,6 @@ def parallelize_model_fsdp2(
             if spec_info.persistent_fsdp_shard_dim is not None
         }
         if persistent_extra_parallel_params:
-            if parallel_state.dp_replicate_enabled:
-                raise NotImplementedError("Persistent ExtraParallel parameters do not support HSDP replicas yet.")
-            if parallel_state.sp_enabled:
-                raise NotImplementedError(
-                    "Persistent ExtraParallel parameters do not support sequence parallelism yet."
-                )
             for para in persistent_para_names:
                 para_mesh = parallel_state.extra_parallel_fsdp_device_mesh[para]
                 flat_mesh = parallel_state.extra_parallel_flat_device_mesh[para]
