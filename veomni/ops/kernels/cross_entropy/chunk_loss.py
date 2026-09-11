@@ -64,13 +64,31 @@ class ChunkLoss(torch.autograd.Function):
         hidden_states_chunks = torch.split(hidden_states, chunk_size, dim=1)
 
         for i in range(len(hidden_states_chunks)):
-            hidden_states_chunk = hidden_states_chunks[i]
             grad_inputs_chunk = grad_inputs_chunks[i]
-            (chunk_grad_input, chunk_grad_weight), (chunk_loss, _) = torch.func.grad_and_value(
-                loss_forward, argnums=(0, 1), has_aux=True
-            )(hidden_states_chunk, head_weight, None, **loss_kwargs_chunks[i])
 
-            accumulated_loss.add_(chunk_loss)
+            # torch.func transforms reject an outer saved_tensors_hooks context.
+            # Build an isolated first-order graph for each chunk instead. The
+            # identity hooks keep these short-lived intermediates on device;
+            # the accumulated gradient buffers saved below remain visible to
+            # the outer activation-offload hooks.
+            with (
+                torch.enable_grad(),
+                torch.autograd.graph.saved_tensors_hooks(lambda tensor: tensor, lambda tensor: tensor),
+            ):
+                hidden_states_chunk = hidden_states_chunks[i].detach().requires_grad_(True)
+                chunk_head_weight = head_weight.detach().requires_grad_(True)
+                chunk_loss, _ = loss_forward(
+                    hidden_states_chunk,
+                    chunk_head_weight,
+                    None,
+                    **loss_kwargs_chunks[i],
+                )
+                chunk_grad_input, chunk_grad_weight = torch.autograd.grad(
+                    chunk_loss,
+                    (hidden_states_chunk, chunk_head_weight),
+                )
+
+            accumulated_loss.add_(chunk_loss.detach())
             grad_inputs_chunk.copy_(chunk_grad_input)
             grad_weight.add_(chunk_grad_weight)
 
