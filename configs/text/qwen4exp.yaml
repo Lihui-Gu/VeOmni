@@ -1,9 +1,9 @@
-# Internal validation only. Qwen4-Exp currently requires the temporary
-# Transformers git revision pinned in pyproject.toml.
 model:
   model_path: Qwen/Qwen3.8-Flash-Next
   ops_implementation:
-    # QSA has no production FlashAttention adapter yet.
+    # QSA has no production FlashAttention adapter; the efficient backend is
+    # qsa_attention_implementation=tilelang (bf16, SM90+), which is what makes
+    # max_seq_len=16384 feasible. The default eager path is quadratic-memory.
     attn_implementation: sdpa
     # This is the GPU default; OpsImplementationConfig resolves the same value
     # to fused_npu when torch_npu is available.

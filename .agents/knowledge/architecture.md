@@ -50,6 +50,7 @@ veomni/
 │   │   └── singleton.py  get_ops_config()/set_ops_config() for patch files
 │   ├── kernels/        Kernel implementations (one subdir per op)
 │   │   ├── deepseek_v4/  TileLang sparse attention/indexer + precision helpers
+│   │   ├── qwen4_exp/    TileLang QSA sparse attention fwd/bwd (SM90+)
 │   │   ├── attention/  Flash attention v2/3/4 + SP-aware variants
 │   │   ├── cross_entropy/  eager/liger/npu-chunk loss variants
 │   │   ├── load_balancing_loss/  eager + triton variants

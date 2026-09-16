@@ -25,5 +25,6 @@ def get_parallel_plan():
     parallel_plan = ParallelPlan(
         extra_parallel_plan={"ple": ple_plan, "ep": ep_plan},
         extra_parallel_persistent_modules=persistent_modules,
+        sequence_parallel_persistent_names={"ple"},
     )
     return parallel_plan
